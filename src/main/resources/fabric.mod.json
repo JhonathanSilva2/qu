@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "ai_civilization",
+  "version": "${version}",
+  "name": "AI Civilization",
+  "description": "Uma civilização de NPCs autônomos, construída em etapas.",
+  "environment": "*",
+  "entrypoints": {
+    "main": ["com.aicivilization.AICivilizationMod"],
+    "client": ["com.aicivilization.client.AICivilizationClient"]
+  },
+  "depends": {
+    "fabricloader": ">=0.18.0",
+    "minecraft": "~1.21.10",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}
