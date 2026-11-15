@@ -365,15 +365,18 @@ public class CitizenEntity extends PathfinderMob {
 
         if (workStuckNoticeCooldown > 0) workStuckNoticeCooldown--;
 
-        // Autonomous Navigation Watchdog: if stuck trying to reach a work target for 30s (600 ticks),
-        // teleport to the nation center banner as a last resort and safely resume.
+        // Autonomous Navigation Watchdog: progressive local recovery before last-resort teleport
         if (hasActiveProfession() && workNavigationExpected(level) && !getNavigation().isDone() && !this.swinging) {
             if (distanceToSqr(workLastX, workLastY, workLastZ) < 0.04) workStuckTicks++;
             else workStuckTicks = 0;
             workLastX = getX();
             workLastY = getY();
             workLastZ = getZ();
-            if (workStuckTicks >= 600) {
+            if (workStuckTicks == 60 || workStuckTicks == 140) {
+                clearBlockingLeavesAround(level);
+                this.getJumpControl().jump();
+                this.getNavigation().recomputePath();
+            } else if (workStuckTicks >= 600) {
                 workStuckTicks = 0;
                 teleportToNationCenter(level);
                 getNavigation().stop();
@@ -578,8 +581,25 @@ public class CitizenEntity extends PathfinderMob {
         return activeJob != null && activeJob.needsNavigation(this, level);
     }
 
+    private void clearBlockingLeavesAround(ServerLevel level) {
+        BlockPos base = this.blockPosition();
+        for (int dx = -1; dx <= 1; dx++) {
+            for (int dz = -1; dz <= 1; dz++) {
+                for (int dy = 0; dy <= 2; dy++) {
+                    BlockPos pos = base.offset(dx, dy, dz);
+                    if (!belongsToNation(pos)) continue;
+                    if (level.getBlockState(pos).is(net.minecraft.tags.BlockTags.LEAVES)) {
+                        level.destroyBlock(pos, true, this);
+                    }
+                }
+            }
+        }
+    }
+
     public static AttributeSupplier.Builder createAttributes() {
         return Mob.createMobAttributes()
-            .add(Attributes.MOVEMENT_SPEED, 0.25);
+            .add(Attributes.MOVEMENT_SPEED, 0.25)
+            .add(Attributes.FOLLOW_RANGE, 64.0)
+            .add(Attributes.STEP_HEIGHT, 1.0);
     }
 }

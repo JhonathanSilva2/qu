@@ -242,6 +242,9 @@ public class AICivilizationMod implements ModInitializer {
             : request.itemId().startsWith(StorageJob.BEST_PICKAXE_REQUEST_ID + ".tier_")
                 ? "picareta tier " + request.itemId().substring((StorageJob.BEST_PICKAXE_REQUEST_ID + ".tier_").length())
             : request.itemId().equals(StorageJob.BEST_SHOVEL_REQUEST_ID) ? "melhor pá disponível"
+            : request.itemId().equals("ai_civilization:resource:minecraft:oak_planks") ? "tábuas de madeira (qualquer espécie)"
+            : request.itemId().equals("ai_civilization:resource:minecraft:oak_stairs") ? "escadas de madeira (qualquer espécie)"
+            : request.itemId().equals("ai_civilization:resource:minecraft:dirt") ? "blocos de terra (dirt)"
             : request.itemId().startsWith("ai_civilization:resource:")
                 ? request.itemId().substring("ai_civilization:resource:".length()) : request.itemId();
         return name + " — " + request.count() + "x " + item;
