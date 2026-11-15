@@ -25,7 +25,9 @@ import net.minecraft.world.level.storage.ValueOutput;
 
 
 /** Builds and repairs three-block-wide dirt roads from the town center to its four borders. */
-public final class BuilderJob {
+public final class BuilderJob implements ProfessionJob {
+    public static final String ID = "builder";
+    public static final String LABEL = "Builder";
     private static final int TICK_INTERVAL = 10;
     private static final int ROAD_WIDTH = 3;
     private static final int[] LANE_OFFSETS = {-1, 0, 1};
@@ -44,6 +46,48 @@ public final class BuilderJob {
     private boolean completed;
     private boolean preparingPlot;
 
+    @Override
+    public String getId() { return ID; }
+
+    @Override
+    public String getLabel() { return LABEL; }
+
+    @Override
+    public boolean start(CitizenEntity citizen, ServerLevel level) {
+        if (citizen.getNationId() == null) return false;
+        CivilizationData.Nation nation = CivilizationData.get(level).getNation(citizen.getNationId());
+        if (nation == null) return false;
+        start(citizen, nation.center());
+        return true;
+    }
+
+    @Override
+    public void stop(CitizenEntity citizen, ServerLevel level, boolean announce) {
+        stop();
+        citizen.getNavigation().stop();
+        if (announce) citizen.announce("Parei o trabalho de construção.");
+    }
+
+    @Override
+    public String workStatus(CitizenEntity citizen, ServerLevel level) { return workStatus(); }
+
+    @Override
+    public String debugStatus(CitizenEntity citizen, ServerLevel level) { return debugStatus(); }
+
+    @Override
+    public boolean needsNavigation(CitizenEntity citizen, ServerLevel level) {
+        CivilizationData data = CivilizationData.get(level);
+        CivilizationData.Warehouse warehouse = data.warehouse(citizen.getNationId());
+        if (warehouse != null && data.warehousePlotRequested(citizen.getNationId())
+            && !data.warehousePlotPrepared(citizen.getNationId())) {
+            return citizen.distanceToSqr(warehouse.x() + 0.5, warehouse.y(), warehouse.z() + 0.5) > 16.0;
+        }
+        if (townCenter == null || completed || directionIndex >= ROAD_DIRECTIONS.length) return false;
+        BlockPos target = roadPosition(ROAD_DIRECTIONS[directionIndex], distance, LANE_OFFSETS[laneIndex]);
+        int y = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, target.getX(), target.getZ());
+        return citizen.distanceToSqr(target.getX() + 0.5, y, target.getZ() + 0.5) > 16.0;
+    }
+
     public void start(CitizenEntity citizen, BlockPos center) {
         townCenter = center.immutable();
         directionIndex = 0;
@@ -58,7 +102,6 @@ public final class BuilderJob {
         completed = false;
         preparingPlot = false;
         cooldown = 0;
-        citizen.announce("Vou abrir e reparar caminhos de terra nas quatro direções da vila até as fronteiras.");
     }
 
     public void stop() {
@@ -128,12 +171,15 @@ public final class BuilderJob {
         CivilizationData.Warehouse warehouse = data.warehouse(citizen.getNationId());
         if (warehouse != null && data.warehousePlotRequested(citizen.getNationId())
             && !data.warehousePlotPrepared(citizen.getNationId())) {
+            if (!preparingPlot && warehousePlotCursor >= 100) warehousePlotCursor = 0;
             preparingPlot = true;
             if (cooldown-- > 0) return;
             cooldown = TICK_INTERVAL;
+            collectNearbyDrops(citizen, level);
             prepareWarehousePlot(citizen, level, warehouse);
             return;
         }
+        if (warehouse == null || data.warehousePlotPrepared(citizen.getNationId())) preparingPlot = false;
         if (completed || cooldown-- > 0) return;
         cooldown = TICK_INTERVAL;
         collectNearbyDrops(citizen, level);
