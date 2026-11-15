@@ -69,3 +69,52 @@ As profissões já possuem texturas dedicadas preparadas em `textures/entity/`. 
 ### Próximos Passos Técnicos:
 - Atualizar o `CitizenEntityRenderer` para selecionar dinamicamente a textura (`Identifier`) com base na profissão atual da entidade (`jobName` / `ProfessionJob`), com fallback para textura padrão de cidadão caso não possua emprego.
 - Suportar troca imediata de aparência no cliente quando o comando `/aiciv npc <nome> <profissão>` for executado ou quando a profissão for atribuída.
+
+---
+
+## 5. Antagonista Global: O Rei Demônio e as Hordas do Fim
+
+**Objetivo:** Criar um antagonista dinâmico para o mundo, trazendo propósito defensivo, militar e diplomático para as civilizações, além de um senso de urgência crescente para o jogador.
+
+### Visão Geral & Comportamento
+O Rei Demônio inicia sua campanha no **Fim (The End)**, onde estabelece seu domínio e ergue seu império enquanto acumula poder. Conforme evolui através de eras de poder, avisos atmosféricos ecoam no chat global e hordas de monstros são enviadas periodicamente para invadir, pilhar e escravizar civilizações no Overworld.
+
+### Pilares de Design:
+
+1. **Simulação Eficiente no The End (Sem Lag):**
+   - Gerenciado via `DemonKingManager` como um `PersistentState` global do servidor.
+   - O império cresce por ticks abstratos (sem necessidade de manter chunks do End carregados desnecessariamente).
+   - Quando o jogador ou espiões adentram o The End, as estruturas da fortaleza e servos são materializados fisicamente.
+
+2. **Evolução & Avisos Globais no Chat:**
+   - Mensagens periódicas de aviso alertam sobre o crescimento do mal:
+     - *Despertar:* `[Sussurros do Fim] Uma força ancestral se agita no Vazio...`
+     - *Expansão:* `[Rei Demônio] O Vazio é pequeno demais. Meus olhos se voltam para o Overworld.`
+     - *Incursão:* `[Alerta Global] Uma fenda dimensional se abriu perto da nação [Nome]!`
+
+3. **Invasões Baseadas em Tempo (Com Trava de Segurança):**
+   - **Gatilho de Tempo:** Hordas são despachadas a cada ciclo de dias do Minecraft (ex: a cada 5 a 7 dias de jogo, verificado em `world.getTime()`).
+   - **Trava de Proteção:** O timer só libera ataques se houver ao menos uma nação estabelecida com estandarte ativo e um número mínimo de cidadãos (ex: 3 cidadãos), evitando punir jogadores no início da sobrevivência.
+   - **Incursão por Fenda:** Portais escuros se abrem nas fronteiras da nação (raio de 128 blocos do estandarte).
+   - **Composição da Horda (Mobs Vanilla):**
+     - Zumbis blindados (machados para quebrar defesas e perseguir cidadãos).
+     - Esqueletos batedores (arco e flechas com efeitos negativos).
+     - Endermen de vanguarda (desestabilizam linhas de defesa e guardas).
+     - Equipados com armaduras escuras e auras de partículas (`portal`, `reverse_portal` ou `sculk_charge_pop`).
+   - **Alvos Prioritários:** Armazém (`Storager`), Estandarte Central e Cidadãos indefesos.
+
+4. **Captura e Escravidão de Cidadãos:**
+   - Cidadãos derrubados pela horda recebem o estado `CAPTURED` e são sugados por fendas dimensionais em vez de morrerem permanentemente.
+   - No The End, tornam-se escravos forçados a minerar End Stone e construir a fortaleza do Rei Demônio.
+   - O jogador ou expedições militares podem invadir o End para resgatar seus trabalhadores cativos.
+
+5. **Corrupção do Overworld (Senso de Urgência):**
+   - Fendas dimensionais e nações destruídas emitem corrupção rastejante.
+   - Blocos ao redor se transformam lentamente (Grama -> Sculk/Podzol escuro/End Stone, folhas murcham e o céu escurece).
+   - Força o jogador a não ignorar a ameaça, sob risco de perder biomas vitais e terras férteis.
+
+6. **Batalha Final e Quebra da Imortalidade:**
+   - **O Guardião:** O **Ender Dragon** atua como o General de Elite do Rei Demônio. O Rei Demônio permanece inacessível/protegido em seu trono até a queda do dragão.
+   - **Imortalidade:** O Rei Demônio é imune a dano convencional.
+   - **Arma Específica:** Para feri-lo, o jogador precisa forjar uma relíquia/arma especial, combinando a essência do dragão derrotado com materiais avançados fornecidos pelas civilizações (ferro refinado, ouro, diamantes e mestres artesãos das vilas).
+

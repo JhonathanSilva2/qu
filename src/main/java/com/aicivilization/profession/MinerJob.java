@@ -169,9 +169,7 @@ public final class MinerJob implements ProfessionJob {
 
     public boolean needsNavigation(CitizenEntity citizen, ServerLevel level) {
         if (toolPickupPending || (!isPickaxe(citizen.getMainHandItem()) && bestInventoryPickaxe(citizen) == null)) {
-            BlockPos base = basePosition(citizen, level);
-            return !citizen.getNavigation().isDone()
-                || citizen.distanceToSqr(base.getX() + 0.5, base.getY(), base.getZ() + 0.5) > 16.0;
+            return !citizen.getNavigation().isDone();
         }
         if (mineOrigin == null) return true;
         BlockPos approach = mineOrigin.relative(direction, step).below(step);
@@ -187,17 +185,16 @@ public final class MinerJob implements ProfessionJob {
     }
 
     /** Gets a suitable pickaxe before allowing the Miner to leave the warehouse base. */
-    private boolean ensurePickaxe(CitizenEntity citizen, ServerLevel level, int minimumTier) {
-        minimumTier = Math.max(minimumTier, requestedPickaxeTier);
+    private boolean ensurePickaxe(CitizenEntity citizen, ServerLevel level) {
         ItemStack held = citizen.getMainHandItem();
-        if (isPickaxe(held) && pickaxeTier(held) >= minimumTier) {
+        if (isPickaxe(held)) {
             toolPickupPending = false;
             toolLookupCooldown = 0;
             requestedPickaxeTier = 0;
             return true;
         }
 
-        Item inventoryPickaxe = bestInventoryPickaxe(citizen, minimumTier);
+        Item inventoryPickaxe = bestInventoryPickaxe(citizen, 0);
         if (inventoryPickaxe != null) {
             citizen.setItemSlot(EquipmentSlot.MAINHAND, citizen.getNpcInventory().removeItemType(inventoryPickaxe, 1));
             toolPickupPending = false;
@@ -206,59 +203,51 @@ public final class MinerJob implements ProfessionJob {
             return true;
         }
 
-        if (!toolPickupPending) {
-            toolPickupPending = true;
-            citizen.getNavigation().stop();
-            announceThrottled(citizen, List.of("Vou voltar à base para procurar uma picareta nos baús."));
+        // Miner has no pickaxe. Deposit mined materials so the Storager can immediately craft tools if needed.
+        StorageJob.depositAllResources(citizen, level);
+
+        // If we are currently navigating towards a chest with a pickaxe:
+        if (toolPickupPending) {
+            if (StorageJob.retrieveBestPickaxe(citizen, level, 0)) {
+                if (isPickaxe(citizen.getMainHandItem())) {
+                    toolPickupPending = false;
+                    toolLookupCooldown = 0;
+                    requestedPickaxeTier = 0;
+                    return true;
+                }
+                return false; // Still walking to the chest; do not cancel or restart navigation
+            }
+            toolPickupPending = false;
         }
+
+        if (toolLookupCooldown > 0) {
+            toolLookupCooldown = Math.max(0, toolLookupCooldown - 8);
+            return false;
+        }
+
+        toolLookupCooldown = 100;
+        if (StorageJob.retrieveBestPickaxe(citizen, level, 0)) {
+            if (isPickaxe(citizen.getMainHandItem())) {
+                toolPickupPending = false;
+                toolLookupCooldown = 0;
+                requestedPickaxeTier = 0;
+                return true;
+            }
+            toolPickupPending = true;
+            return false; // Walking towards the chest
+        }
+
+        // Truly no pickaxe in any warehouse chest
+        CivilizationData.get(level).requestStorageItem(citizen.getNationId(), citizen.getUUID(),
+            StorageJob.pickaxeRequestId(0), 1);
+        announceThrottled(citizen, List.of("Não achei picareta nos baús. Pedi uma ao Storager e vou aguardar na base."));
+
         BlockPos base = basePosition(citizen, level);
         double baseX = base.getX() + 0.5;
         double baseY = base.getY();
         double baseZ = base.getZ() + 0.5;
         if (citizen.distanceToSqr(baseX, baseY, baseZ) > 16.0) {
             if (citizen.getNavigation().isDone()) citizen.getNavigation().moveTo(baseX, baseY, baseZ, 0.9);
-            return false;
-        }
-
-        // Descarregar recursos ao voltar à base para que o Storager possa fabricar ferramentas
-        if (StorageJob.depositAllResources(citizen, level)) {
-            citizen.announce("Descarreguei meus recursos no armazém para fabricarem novas ferramentas.");
-        }
-
-        // Do not restart a path to a chest every work tick. Check again when the current
-        // path finishes, or immediately while standing at the base.
-        if (citizen.getNavigation().isDone()) {
-            if (StorageJob.retrieveBestPickaxe(citizen, level, minimumTier)) return false;
-            // Se não encontrou a picareta ideal, pega qualquer picareta disponível no baú
-            if (minimumTier > 0 && StorageJob.retrieveBestPickaxe(citizen, level, 0)) {
-                requestedPickaxeTier = 0;
-                toolPickupPending = false;
-                citizen.announce("Não encontrei a picareta ideal, mas peguei uma reserva no baú para continuar minerando.");
-                return false;
-            }
-        }
-
-        // Se tiver qualquer picareta no inventário (mesmo tier menor), equipa e vai minerar
-        Item fallbackInventoryPickaxe = bestInventoryPickaxe(citizen, 0);
-        if (fallbackInventoryPickaxe != null) {
-            citizen.setItemSlot(EquipmentSlot.MAINHAND, citizen.getNpcInventory().removeItemType(fallbackInventoryPickaxe, 1));
-            toolPickupPending = false;
-            toolLookupCooldown = 0;
-            requestedPickaxeTier = 0;
-            citizen.announce("Equipei uma picareta reserva do meu inventário e voltei ao trabalho.");
-            return true;
-        }
-
-        if (toolLookupCooldown <= 0) {
-            CivilizationData.get(level).requestStorageItem(citizen.getNationId(), citizen.getUUID(),
-                StorageJob.pickaxeRequestId(minimumTier), 1);
-            announceThrottled(citizen, List.of(minimumTier > 0
-                ? "Não achei a picareta necessária nos baús. Pedi uma melhor ao Storager e vou aguardar na base."
-                : "Não achei picareta nos baús. Pedi uma ao Storager e vou aguardar na base."));
-            toolLookupCooldown = 100;
-            citizen.getNavigation().stop();
-        } else {
-            toolLookupCooldown = Math.max(0, toolLookupCooldown - 8);
         }
         return false;
     }
@@ -272,6 +261,7 @@ public final class MinerJob implements ProfessionJob {
         if (oreDeliveryPending) {
             if (deliverOreResources(citizen, level)) return;
             oreDeliveryPending = false;
+            StorageJob.depositAllResources(citizen, level);
         }
 
         Item fullStack = fullResourceStack(citizen);
@@ -281,7 +271,7 @@ public final class MinerJob implements ProfessionJob {
         }
 
         if (mineOrigin == null) chooseMineSite(citizen, level);
-        if (!ensurePickaxe(citizen, level, 0)) return;
+        if (!ensurePickaxe(citizen, level)) return;
 
         if (mineOrigin == null) chooseMineSite(citizen, level);
         if (mineOrigin == null) return;
