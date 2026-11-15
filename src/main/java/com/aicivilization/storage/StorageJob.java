@@ -572,14 +572,11 @@ public final class StorageJob implements ProfessionJob {
                 }
                 continue;
             }
-            if (countItem(citizen.getNpcInventory(), chestPositions, level, Items.STICK) < 2) {
-                int requiredPlanks = recipe.usesPlanks() ? recipe.materialCount() + 2 : 2;
-                if (countTaggedItems(citizen.getNpcInventory(), chestPositions, level, ItemTags.PLANKS) < requiredPlanks
-                    && !convertLogsToPlanks(citizen, chestPositions, level)) continue;
-                if (!convertPlanksToSticks(citizen, chestPositions, level)) continue;
-                recipe = findCraftableTool(citizen.getNpcInventory(), chestPositions, level, recipes);
-                if (recipe == null) continue;
-            }
+            if (!ensurePlanksForTool(citizen, level, warehouse, chestPositions, recipe)) continue;
+            if (countItem(citizen.getNpcInventory(), chestPositions, level, Items.STICK) < 2
+                && !convertPlanksToSticks(citizen, chestPositions, level)) continue;
+            recipe = findCraftableTool(citizen.getNpcInventory(), chestPositions, level, recipes);
+            if (recipe == null) continue;
             ItemStack toolStack = new ItemStack(recipe.tool());
             if (chestPositions.isEmpty()) {
                 boolean consumedMaterial = recipe.usesPlanks()
@@ -629,6 +626,22 @@ public final class StorageJob implements ProfessionJob {
             if (materialCount >= recipe.materialCount()) return recipe;
         }
         return null;
+    }
+
+    private boolean ensurePlanksForTool(CitizenEntity citizen, ServerLevel level,
+                                        CivilizationData.Warehouse warehouse, List<BlockPos> chests,
+                                        ToolRecipe recipe) {
+        for (int attempt = 0; attempt < 8; attempt++) {
+            int requiredPlanks = (recipe.usesPlanks() ? recipe.materialCount() : 0)
+                + (countItem(citizen.getNpcInventory(), chests, level, Items.STICK) < 2 ? 2 : 0);
+            if (countTaggedItems(citizen.getNpcInventory(), chests, level, ItemTags.PLANKS) >= requiredPlanks) return true;
+            if (convertLogsToPlanks(citizen, chests, level)) continue;
+            if (takeLogsFromNearbyCitizen(citizen, level, warehouse, 2)) continue;
+            return false;
+        }
+        int requiredPlanks = (recipe.usesPlanks() ? recipe.materialCount() : 0)
+            + (countItem(citizen.getNpcInventory(), chests, level, Items.STICK) < 2 ? 2 : 0);
+        return countTaggedItems(citizen.getNpcInventory(), chests, level, ItemTags.PLANKS) >= requiredPlanks;
     }
 
     private void processResourceRequest(CitizenEntity storager, CivilizationData data,
@@ -733,9 +746,9 @@ public final class StorageJob implements ProfessionJob {
         Item planksItem = planksForLog(log);
         if (planksItem == Items.AIR) return false;
         int available = countItem(citizen.getNpcInventory(), chestPositions, level, log);
-        if (available < 2) return false;
-        if (!consumeItem(citizen.getNpcInventory(), chestPositions, level, log, 2)) return false;
-        ItemStack planks = new ItemStack(planksItem, 8);
+        if (available < 1) return false;
+        if (!consumeItem(citizen.getNpcInventory(), chestPositions, level, log, 1)) return false;
+        ItemStack planks = new ItemStack(planksItem, 4);
         ItemStack remainder = insert(citizen.getNpcInventory(), planks);
         if (!remainder.isEmpty()) {
             for (BlockPos pos : chestPositions) {
@@ -745,7 +758,7 @@ public final class StorageJob implements ProfessionJob {
             }
         }
         if (!remainder.isEmpty()) {
-            insert(citizen.getNpcInventory(), new ItemStack(log, 2));
+            insert(citizen.getNpcInventory(), new ItemStack(log, 1));
             return false;
         }
         return true;
@@ -1242,14 +1255,14 @@ public final class StorageJob implements ProfessionJob {
     private static Item findConvertibleLog(Container inventory, List<BlockPos> chestPositions, ServerLevel level) {
         for (int i = 0; i < inventory.getContainerSize(); i++) {
             ItemStack stack = inventory.getItem(i);
-            if (stack.is(ItemTags.LOGS) && countItem(inventory, chestPositions, level, stack.getItem()) >= 2
+            if (stack.is(ItemTags.LOGS) && countItem(inventory, chestPositions, level, stack.getItem()) >= 1
                 && planksForLog(stack.getItem()) != Items.AIR) return stack.getItem();
         }
         for (BlockPos pos : chestPositions) {
             if (!(level.getBlockEntity(pos) instanceof ChestBlockEntity chest)) continue;
             for (int i = 0; i < chest.getContainerSize(); i++) {
                 ItemStack stack = chest.getItem(i);
-                if (stack.is(ItemTags.LOGS) && countItem(inventory, chestPositions, level, stack.getItem()) >= 2
+                if (stack.is(ItemTags.LOGS) && countItem(inventory, chestPositions, level, stack.getItem()) >= 1
                     && planksForLog(stack.getItem()) != Items.AIR) return stack.getItem();
             }
         }
