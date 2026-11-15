@@ -9,6 +9,7 @@ import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.tags.ItemTags;
 import net.minecraft.tags.BlockTags;
 import net.minecraft.tags.TagKey;
@@ -95,6 +96,9 @@ public final class StorageJob implements ProfessionJob {
             data.releaseStorager(citizen.getNationId(), citizen.getUUID());
             citizen.announce("Não encontrei um local seguro para o armazém fora da área central do estandarte.");
             return false;
+        }
+        if (!citizen.getMainHandItem().is(ItemTags.AXES) && !citizen.getNpcInventory().hasAnyMatching(stack -> stack.is(ItemTags.AXES))) {
+            citizen.setItemSlot(EquipmentSlot.MAINHAND, new ItemStack(Items.WOODEN_AXE));
         }
         citizen.announce("Vou organizar o armazém da minha nação.");
         return true;

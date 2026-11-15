@@ -118,8 +118,12 @@ public final class LumberjackJob implements ProfessionJob {
         this.reforestationCooldown = 0;
         this.lumberjackDeliveryPending = false;
         this.toolLookupCooldown = 0;
-        this.toolPickupPending = false;
         this.phase = WorkPhase.SEARCHING;
+
+        if (!isAxe(citizen.getMainHandItem()) && bestInventoryAxe(citizen) == null) {
+            citizen.setItemSlot(EquipmentSlot.MAINHAND, new ItemStack(Items.WOODEN_AXE));
+        }
+
         citizen.announce("Vou trabalhar como lenhador e procurar árvores.");
         return true;
     }

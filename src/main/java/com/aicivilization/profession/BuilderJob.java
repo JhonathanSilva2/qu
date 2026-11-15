@@ -64,6 +64,12 @@ public final class BuilderJob implements ProfessionJob {
         CivilizationData.Nation nation = CivilizationData.get(level).getNation(citizen.getNationId());
         if (nation == null) return false;
         start(citizen, nation.center());
+        if (!citizen.getMainHandItem().is(ItemTags.SHOVELS) && findInventorySlot(citizen, ItemTags.SHOVELS) < 0) {
+            citizen.setItemSlot(EquipmentSlot.MAINHAND, new ItemStack(Items.WOODEN_SHOVEL));
+        }
+        if (!citizen.getMainHandItem().is(ItemTags.PICKAXES) && findInventorySlot(citizen, ItemTags.PICKAXES) < 0) {
+            citizen.getNpcInventory().addItem(new ItemStack(Items.WOODEN_PICKAXE));
+        }
         return true;
     }
 
