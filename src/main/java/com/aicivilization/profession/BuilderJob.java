@@ -1,5 +1,6 @@
 package com.aicivilization.profession;
 
+import com.aicivilization.blueprint.GridBlueprint;
 import com.aicivilization.data.CivilizationData;
 import com.aicivilization.entity.CitizenEntity;
 import com.aicivilization.storage.StorageJob;
@@ -11,6 +12,7 @@ import net.minecraft.tags.BlockTags;
 import net.minecraft.tags.FluidTags;
 import net.minecraft.tags.ItemTags;
 import net.minecraft.world.entity.EquipmentSlot;
+import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
@@ -32,17 +34,21 @@ public final class BuilderJob implements ProfessionJob {
     private static final int ROAD_WIDTH = 3;
     private static final int[] LANE_OFFSETS = {-1, 0, 1};
     private static final Direction[] ROAD_DIRECTIONS = {Direction.EAST, Direction.SOUTH, Direction.WEST, Direction.NORTH};
+    private static GridBlueprint VILLAGE_CENTER_BLUEPRINT;
     private int cooldown;
     private BlockPos townCenter;
     private int directionIndex;
     private int distance = 1;
     private int laneIndex;
     private int warehousePlotCursor;
+    private int plazaCursor;
     private int[] previousSurfaceY = new int[ROAD_WIDTH];
     private String pendingResourceId = "";
     private boolean shovelRequestSent;
     private boolean pickaxeRequestSent;
     private boolean stairRequestSent;
+    private boolean dirtSearchAnnounced;
+    private BlockPos dirtSourceTarget;
     private boolean completed;
     private boolean preparingPlot;
 
@@ -82,7 +88,12 @@ public final class BuilderJob implements ProfessionJob {
             && !data.warehousePlotPrepared(citizen.getNationId())) {
             return citizen.distanceToSqr(warehouse.x() + 0.5, warehouse.y(), warehouse.z() + 0.5) > 16.0;
         }
-        if (townCenter == null || completed || directionIndex >= ROAD_DIRECTIONS.length) return false;
+        if (townCenter == null) return false;
+        if (plazaCursor < villageCenterBlueprint(level).width() * villageCenterBlueprint(level).depth()) {
+            BlockPos target = plazaPosition(villageCenterBlueprint(level), plazaCursor);
+            return citizen.distanceToSqr(target.getX() + 0.5, townCenter.getY(), target.getZ() + 0.5) > 16.0;
+        }
+        if (completed || directionIndex >= ROAD_DIRECTIONS.length) return false;
         BlockPos target = roadPosition(ROAD_DIRECTIONS[directionIndex], distance, LANE_OFFSETS[laneIndex]);
         int y = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, target.getX(), target.getZ());
         return citizen.distanceToSqr(target.getX() + 0.5, y, target.getZ() + 0.5) > 16.0;
@@ -94,11 +105,14 @@ public final class BuilderJob implements ProfessionJob {
         distance = 1;
         laneIndex = 0;
         warehousePlotCursor = 0;
+        plazaCursor = 0;
         previousSurfaceY = new int[ROAD_WIDTH];
         pendingResourceId = "";
         shovelRequestSent = false;
         pickaxeRequestSent = false;
         stairRequestSent = false;
+        dirtSearchAnnounced = false;
+        dirtSourceTarget = null;
         completed = false;
         preparingPlot = false;
         cooldown = 0;
@@ -116,11 +130,13 @@ public final class BuilderJob implements ProfessionJob {
         output.putInt("BuilderDistance", distance);
         output.putInt("BuilderLane", laneIndex);
         output.putInt("BuilderWarehousePlotCursor", warehousePlotCursor);
+        output.putInt("BuilderPlazaCursor", plazaCursor);
         output.putIntArray("BuilderPreviousSurfaceY", previousSurfaceY);
         output.putString("BuilderPendingResource", pendingResourceId);
         output.putBoolean("BuilderShovelRequestSent", shovelRequestSent);
         output.putBoolean("BuilderPickaxeRequestSent", pickaxeRequestSent);
         output.putBoolean("BuilderStairRequestSent", stairRequestSent);
+        output.putBoolean("BuilderDirtSearchAnnounced", dirtSearchAnnounced);
         output.putBoolean("BuilderCompleted", completed);
         output.putBoolean("BuilderPreparingPlot", preparingPlot);
     }
@@ -131,18 +147,20 @@ public final class BuilderJob implements ProfessionJob {
         distance = Math.max(1, input.getIntOr("BuilderDistance", 1));
         laneIndex = Math.max(0, Math.min(ROAD_WIDTH - 1, input.getIntOr("BuilderLane", 0)));
         warehousePlotCursor = Math.max(0, Math.min(100, input.getIntOr("BuilderWarehousePlotCursor", 0)));
+        plazaCursor = Math.max(0, Math.min(35, input.getIntOr("BuilderPlazaCursor", 0)));
         previousSurfaceY = input.getIntArray("BuilderPreviousSurfaceY").filter(values -> values.length == ROAD_WIDTH)
             .orElse(new int[ROAD_WIDTH]);
         pendingResourceId = input.getStringOr("BuilderPendingResource", "");
         shovelRequestSent = input.getBooleanOr("BuilderShovelRequestSent", false);
         pickaxeRequestSent = input.getBooleanOr("BuilderPickaxeRequestSent", false);
         stairRequestSent = input.getBooleanOr("BuilderStairRequestSent", false);
+        dirtSearchAnnounced = input.getBooleanOr("BuilderDirtSearchAnnounced", false);
         completed = input.getBooleanOr("BuilderCompleted", false);
         preparingPlot = input.getBooleanOr("BuilderPreparingPlot", false);
     }
 
     public boolean isActive() {
-        return townCenter != null && !completed;
+        return townCenter != null && (!completed || plazaCursor < 35);
     }
 
     public boolean isInitialized() { return townCenter != null; }
@@ -150,13 +168,14 @@ public final class BuilderJob implements ProfessionJob {
     public String workStatus() {
         if (townCenter == null) return "Planejando os caminhos da vila";
         if (preparingPlot) return "Preparando terreno 10x10 para os baús: " + warehousePlotCursor + "%";
+        if (plazaCursor < 35) return "Construindo a praça de madeira do centro: " + plazaCursor + "/35";
         if (completed) return "Os quatro caminhos até as fronteiras estão prontos";
         return "Construindo caminho " + directionName() + ", trecho " + distance + "/"
             + CivilizationData.NATION_RADIUS_BLOCKS + ", faixa " + (laneIndex + 1) + "/" + ROAD_WIDTH;
     }
 
     public String debugStatus() {
-        return "active=" + isActive() + ", plot=" + warehousePlotCursor + "/100, direction=" + directionName() + ", distance=" + distance
+        return "active=" + isActive() + ", plot=" + warehousePlotCursor + "/100, plaza=" + plazaCursor + "/35, direction=" + directionName() + ", distance=" + distance
             + ", lane=" + laneIndex + ", pending=" + pendingResourceId;
     }
 
@@ -180,9 +199,14 @@ public final class BuilderJob implements ProfessionJob {
             return;
         }
         if (warehouse == null || data.warehousePlotPrepared(citizen.getNationId())) preparingPlot = false;
-        if (completed || cooldown-- > 0) return;
+        if (cooldown-- > 0) return;
         cooldown = TICK_INTERVAL;
         collectNearbyDrops(citizen, level);
+        if (plazaCursor < 35) {
+            buildVillageCenter(citizen, level);
+            return;
+        }
+        if (completed) return;
         if (directionIndex >= ROAD_DIRECTIONS.length) {
             completed = true;
             citizen.announce("Concluí e revisei os caminhos nas quatro direções da vila.");
@@ -223,7 +247,7 @@ public final class BuilderJob implements ProfessionJob {
 
         if (isExposedStone(groundState)) {
             if (!equipPickaxe(citizen, level)) return;
-            if (!ensureResource(citizen, level, Items.DIRT, 1)) return;
+            if (!ensureDirt(citizen, level, ground)) return;
             citizen.swing(net.minecraft.world.InteractionHand.MAIN_HAND);
             if (!level.destroyBlock(ground, true, citizen)) return;
             BlockPos dirtPos = ground;
@@ -233,7 +257,7 @@ public final class BuilderJob implements ProfessionJob {
         }
 
         if (!groundState.isFaceSturdy(level, ground, Direction.UP)) {
-            if (!ensureResource(citizen, level, Items.DIRT, 1)) return;
+            if (!ensureDirt(citizen, level, ground)) return;
             if (!placeBlockFromInventory(citizen, level, ground, Blocks.DIRT.defaultBlockState(), Items.DIRT)) return;
             return;
         }
@@ -279,7 +303,7 @@ public final class BuilderJob implements ProfessionJob {
         int currentGroundY = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z) - 1;
         BlockPos currentGround = new BlockPos(x, currentGroundY, z);
         if (level.getFluidState(currentGround).is(FluidTags.WATER)) {
-            if (!ensureResource(citizen, level, Items.DIRT, 1, 64)) return;
+            if (!ensureDirt(citizen, level, currentGround)) return;
             placeBlockFromInventory(citizen, level, currentGround, Blocks.DIRT.defaultBlockState(), Items.DIRT);
             return;
         }
@@ -295,8 +319,8 @@ public final class BuilderJob implements ProfessionJob {
             return;
         }
         if (currentGroundY < targetGroundY) {
-            if (!ensureResource(citizen, level, Items.DIRT, 1, 64)) return;
             BlockPos fill = new BlockPos(x, currentGroundY + 1, z);
+            if (!ensureDirt(citizen, level, fill)) return;
             if (placeBlockFromInventory(citizen, level, fill, Blocks.DIRT.defaultBlockState(), Items.DIRT)) return;
             return;
         }
@@ -307,6 +331,74 @@ public final class BuilderJob implements ProfessionJob {
             preparingPlot = false;
             citizen.announce("O terreno plano de 10x10 da warehouse está pronto; o Storager já pode construir os baús.");
         }
+    }
+
+    private void buildVillageCenter(CitizenEntity citizen, ServerLevel level) {
+        GridBlueprint blueprint = villageCenterBlueprint(level);
+        int totalCells = blueprint.width() * blueprint.depth();
+        if (plazaCursor >= totalCells) {
+            citizen.announce("Concluí a praça de madeira ao redor do estandarte da vila.");
+            return;
+        }
+
+        char cell = blueprint.cellAt(plazaCursor % blueprint.width(), plazaCursor / blueprint.width());
+        if (cell != 'P') {
+            advancePlazaCursor(citizen, totalCells);
+            return;
+        }
+
+        BlockPos floor = plazaPosition(blueprint, plazaCursor).below();
+        BlockPos standingPosition = floor.above();
+        if (!citizen.isInsideNation(floor)) {
+            advancePlazaCursor(citizen, totalCells);
+            return;
+        }
+        if (!level.hasChunkAt(floor)) return;
+        if (citizen.distanceToSqr(standingPosition.getX() + 0.5, standingPosition.getY(),
+            standingPosition.getZ() + 0.5) > 16.0) {
+            if (citizen.getNavigation().isDone())
+                citizen.getNavigation().moveTo(standingPosition.getX() + 0.5, standingPosition.getY(),
+                    standingPosition.getZ() + 0.5, 0.9);
+            return;
+        }
+
+        BlockState ground = level.getBlockState(floor);
+        if (ground.is(Blocks.OAK_PLANKS)) {
+            advancePlazaCursor(citizen, totalCells);
+            return;
+        }
+        if (ground.hasBlockEntity() || !isNaturalPlazaGround(ground)
+            || !level.getBlockState(standingPosition).canBeReplaced()) {
+            advancePlazaCursor(citizen, totalCells);
+            return;
+        }
+        if (!ensureResource(citizen, level, Items.OAK_PLANKS, 1, 34)) return;
+        if (!placeBlockFromInventory(citizen, level, floor, Blocks.OAK_PLANKS.defaultBlockState(), Items.OAK_PLANKS)) return;
+        advancePlazaCursor(citizen, totalCells);
+    }
+
+    private void advancePlazaCursor(CitizenEntity citizen, int totalCells) {
+        plazaCursor++;
+        if (plazaCursor >= totalCells) citizen.announce("Concluí a praça de madeira ao redor do estandarte da vila.");
+    }
+
+    private BlockPos plazaPosition(GridBlueprint blueprint, int cursor) {
+        int column = cursor % blueprint.width();
+        int row = cursor / blueprint.width();
+        return new BlockPos(townCenter.getX() + column - blueprint.width() / 2, townCenter.getY(),
+            townCenter.getZ() + row - blueprint.depth() / 2);
+    }
+
+    private static GridBlueprint villageCenterBlueprint(ServerLevel level) {
+        if (VILLAGE_CENTER_BLUEPRINT == null)
+            VILLAGE_CENTER_BLUEPRINT = GridBlueprint.load(level, "village_center_7x5");
+        return VILLAGE_CENTER_BLUEPRINT;
+    }
+
+    private static boolean isNaturalPlazaGround(BlockState state) {
+        return state.is(BlockTags.DIRT) || state.is(Blocks.GRASS_BLOCK) || state.is(Blocks.PODZOL)
+            || state.is(Blocks.MYCELIUM) || state.is(Blocks.MOSS_BLOCK)
+            || state.is(BlockTags.BASE_STONE_OVERWORLD);
     }
 
     private void buildBridgeCell(CitizenEntity citizen, ServerLevel level, BlockPos deck, Direction direction) {
@@ -413,6 +505,122 @@ public final class BuilderJob implements ProfessionJob {
     private boolean ensureResource(CitizenEntity citizen, ServerLevel level, Item item, int amount) {
         return ensureResource(citizen, level, item, amount, amount);
     }
+
+    private boolean ensureDirt(CitizenEntity citizen, ServerLevel level, BlockPos workPosition) {
+        CivilizationData data = CivilizationData.get(level);
+        String dirtRequestId = StorageJob.resourceRequestId(Items.DIRT);
+        if (countItem(citizen, Items.DIRT) > 0) {
+            cancelDirtRequest(citizen, data, dirtRequestId);
+            pendingResourceId = "";
+            dirtSearchAnnounced = false;
+            dirtSourceTarget = null;
+            return true;
+        }
+
+        if (!pendingResourceId.equals(BuiltInRegistries.ITEM.getKey(Items.DIRT).toString())) {
+            pendingResourceId = BuiltInRegistries.ITEM.getKey(Items.DIRT).toString();
+            requestResource(citizen, level, Items.DIRT, 1);
+        }
+        java.util.UUID storagerId = data.storager(citizen.getNationId());
+        Entity storagerEntity = storagerId == null ? null : level.getEntity(storagerId);
+        if (storagerEntity instanceof CitizenEntity storager && countItem(storager, Items.DIRT) > 0) {
+            StorageJob.retrieveRequestedItem(citizen, level, Items.DIRT, 1);
+            if (countItem(citizen, Items.DIRT) > 0) {
+                cancelDirtRequest(citizen, data, dirtRequestId);
+                pendingResourceId = "";
+                dirtSearchAnnounced = false;
+                dirtSourceTarget = null;
+                return true;
+            }
+            return false;
+        }
+
+        DirtSource source = findDirtSource(citizen, level, workPosition);
+        if (source == null) {
+            dirtSourceTarget = null;
+            return false;
+        }
+        if (!dirtSearchAnnounced) {
+            citizen.announce("O Storager não tem terra disponível; vou buscar um bloco nas proximidades.");
+            dirtSearchAnnounced = true;
+        }
+        if (citizen.distanceToSqr(source.standPosition().getX() + 0.5, source.standPosition().getY(),
+            source.standPosition().getZ() + 0.5) > 9.0) {
+            if (dirtSourceTarget == null || !dirtSourceTarget.equals(source.position())) {
+                citizen.getNavigation().stop();
+                citizen.getNavigation().moveTo(source.standPosition().getX() + 0.5, source.standPosition().getY(),
+                    source.standPosition().getZ() + 0.5, 0.9);
+                dirtSourceTarget = source.position().immutable();
+            } else if (citizen.getNavigation().isDone()) {
+                citizen.getNavigation().moveTo(source.standPosition().getX() + 0.5, source.standPosition().getY(),
+                    source.standPosition().getZ() + 0.5, 0.9);
+            }
+            return false;
+        }
+        if (!equipShovel(citizen, level)) return false;
+        citizen.getLookControl().setLookAt(source.position().getX() + 0.5, source.position().getY() + 0.5,
+            source.position().getZ() + 0.5);
+        citizen.swing(net.minecraft.world.InteractionHand.MAIN_HAND);
+        if (level.destroyBlock(source.position(), true, citizen)) {
+            citizen.getMainHandItem().hurtAndBreak(1, citizen, EquipmentSlot.MAINHAND);
+            dirtSourceTarget = null;
+        }
+        return false;
+    }
+
+    private DirtSource findDirtSource(CitizenEntity citizen, ServerLevel level, BlockPos workPosition) {
+        BlockPos origin = citizen.blockPosition();
+        DirtSource closest = null;
+        double closestDistance = Double.MAX_VALUE;
+        for (int x = origin.getX() - 8; x <= origin.getX() + 8; x++) {
+            for (int z = origin.getZ() - 8; z <= origin.getZ() + 8; z++) {
+                if ((x - origin.getX()) * (x - origin.getX()) + (z - origin.getZ()) * (z - origin.getZ()) > 64) continue;
+                int y = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z) - 1;
+                BlockPos source = new BlockPos(x, y, z);
+                if (source.equals(workPosition) || source.distSqr(workPosition) <= 2.0
+                    || !level.hasChunkAt(source) || !citizen.isInsideNation(source)
+                    || isReservedConstructionPosition(source, citizen, level)
+                    || !(level.getBlockState(source).is(Blocks.DIRT) || level.getBlockState(source).is(Blocks.GRASS_BLOCK))
+                    || !level.getBlockState(source.above()).isAir()) continue;
+
+                for (Direction direction : Direction.Plane.HORIZONTAL) {
+                    BlockPos stand = source.relative(direction).above();
+                    if (!level.hasChunkAt(stand) || !citizen.isInsideNation(stand)
+                        || !level.getBlockState(stand).canBeReplaced()
+                        || !level.getBlockState(stand.above()).canBeReplaced()
+                        || !level.getBlockState(stand.below()).isFaceSturdy(level, stand.below(), Direction.UP)) continue;
+                    double distance = stand.distSqr(origin);
+                    if (distance < closestDistance) {
+                        closestDistance = distance;
+                        closest = new DirtSource(source, stand);
+                    }
+                }
+            }
+        }
+        return closest;
+    }
+
+    private boolean isReservedConstructionPosition(BlockPos position, CitizenEntity citizen, ServerLevel level) {
+        if (townCenter != null) {
+            int dx = Math.abs(position.getX() - townCenter.getX());
+            int dz = Math.abs(position.getZ() - townCenter.getZ());
+            if (dx <= 3 && dz <= 2) return true;
+            if ((dx <= 1 && dz <= CivilizationData.NATION_RADIUS_BLOCKS)
+                || (dz <= 1 && dx <= CivilizationData.NATION_RADIUS_BLOCKS)) return true;
+        }
+        CivilizationData.Warehouse warehouse = CivilizationData.get(level).warehouse(citizen.getNationId());
+        return warehouse != null && Math.abs(position.getX() - warehouse.x()) <= 5
+            && Math.abs(position.getZ() - warehouse.z()) <= 5;
+    }
+
+    private void cancelDirtRequest(CitizenEntity citizen, CivilizationData data, String dirtRequestId) {
+        for (CivilizationData.StorageRequest request : data.openStorageRequests(citizen.getNationId())) {
+            if (request.requesterId().equals(citizen.getUUID()) && request.itemId().equals(dirtRequestId))
+                data.fulfillStorageRequest(request.id());
+        }
+    }
+
+    private record DirtSource(BlockPos position, BlockPos standPosition) { }
 
     private boolean ensureResource(CitizenEntity citizen, ServerLevel level, Item item, int amount, int requestAmount) {
         if (countItem(citizen, item) >= amount) {
