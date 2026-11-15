@@ -88,6 +88,13 @@ O repositório antigo é um bot Mineflayer para Minecraft 1.20.6, conectado ao s
 - [x] Lenhador derruba em conjunto os troncos conectados, cria drops com movimento de queda, quebra folhas próximas com loot vanilla, recolhe troncos/mudas/gravetos/maçãs e planta uma muda na base quando disponível.
 - [x] Mudas coletáveis são reconhecidas pela tag vanilla, incluindo espécies novas ou compatíveis que adotem essa tag.
 - [x] Inventário cheio interrompe o trabalho do lenhador após preservar os itens restantes no mundo.
+- [x] Blueprints em grade JSON carregados pelo mod: armazém 10x10 com a distribuição de baús definida e praça central 7x5 com estandarte no centro.
+- [x] Na criação da civilização, a praça aplica tábuas de carvalho sobre terreno natural no mesmo nível do centro; células sobre construções/blocos com entidade são preservadas.
+- [x] Storager constrói baús nas células `A` do blueprint do armazém após o Builder preparar o terreno 10x10; as células `x` ficam como corredores/espaços vazios.
+- [x] O painel de pedidos do Storager abre pela tecla `K`, recebe a fila da nação pelo servidor e permite atualizar a lista; `/aiciv storage queue` continua disponível.
+- [x] Pedidos de ferramenta ficam abertos até o Storager levar o item ao cidadão; enquanto isso o cidadão aguarda e não retira a mesma ferramenta sozinho do baú.
+- [x] A busca de baús reconhece somente as células do blueprint, o baú de entrada registrado e posições do layout antigo; baús aleatórios próximos não são adotados como warehouse.
+- [x] Antes de o Builder concluir o terreno, pedidos de ferramentas podem ser processados com recursos carregados pelo Storager; baús próximos não bloqueiam esse ciclo.
 
 ### Testes dentro do Minecraft
 
@@ -109,6 +116,7 @@ O repositório antigo é um bot Mineflayer para Minecraft 1.20.6, conectado ao s
 - [ ] Invocar outro cidadão dentro dos 128 blocos e confirmar que ele entra na nação existente; invocar fora e confirmar novo país/estandarte.
 - [ ] Mandar cidadão seguir/juntar madeira até a borda e confirmar que ele não cruza para território vizinho.
 - [ ] Confirmar que o estandarte aparece no centro e continua depois de salvar/reabrir o mundo.
+- [ ] Criar uma civilização e confirmar a praça 7x5 de tábuas ao redor do estandarte; conferir que terreno não natural/construções próximos não foram substituídos.
 - [ ] Salvar/reabrir mundo e confirmar persistência dos IDs de nação, inventário e locais.
 - [ ] Marcar local com `/aiciv location set base`, listar, mandar NPC com `/aiciv npc <nome|slot> go base` e confirmar chegada.
 - [ ] Testar viagem com obstáculo e dimensão diferente; avaliar as limitações da navegação.
@@ -126,7 +134,10 @@ O repositório antigo é um bot Mineflayer para Minecraft 1.20.6, conectado ao s
 - [ ] Com o Storager e um lenhador próximos, confirmar que o Storager separa 2 troncos do inventário do lenhador, constrói o baú de entrada e o lenhador volta a completar/entregar 64.
 - [ ] Atribuir um lenhador e consultar `/aiciv storage queue`; confirmar o pedido de machado quando não houver ferramenta disponível.
 - [ ] Entregar um pack de 64 troncos e conferir chegada ao baú de entrada, criação de baús de saída e separação por recurso.
+- [ ] Confirmar que o Storager posiciona os baús na grade 10x10 do blueprint, mantém os corredores vazios e cria os pares adjacentes previstos no desenho.
+- [ ] Pressionar `K` dentro do mundo e confirmar que o painel lista pedidos pendentes por cidadão, permite rolar/atualizar e fecha normalmente.
 - [ ] Confirmar que o Storager fabrica e disponibiliza o machado; consultar a fila e o status antes e depois do atendimento.
+- [ ] Pedir uma ferramenta como Miner ou LumberJack e confirmar que o Storager sai até o solicitante, entrega o item e só então o pedido some da fila.
 - [ ] Sem machado e com o Storager ativo, confirmar pedido, coleta de troncos quando faltarem tábuas, fabricação e retirada do machado pelo Lumberjack.
 - [ ] Testar baú cheio, falta de material para baú, ausência de machado e inventário do lenhador cheio.
 - [ ] Salvar e reabrir o mundo com cidadãos trabalhando; confirmar que Miner e Storager retomam suas rotinas.
@@ -200,6 +211,7 @@ O repositório antigo é um bot Mineflayer para Minecraft 1.20.6, conectado ao s
 | 2026-11-14 | 1.21.10 / Fabric Loader 0.18.0 | `compileJava` e `compileClientJava` após corrigir atributo de movimento e retomada de profissões | `BUILD SUCCESSFUL` com Fabric Loom 1.19.4. Ainda falta confirmar movimento e retomada no jogo. | Entrar no mundo salvo e verificar caminhada do Storager, Miner e lenhador. |
 | 2026-11-14 | 1.21.10 / Fabric Loader 0.18.0 | `remapJar` após diagnóstico de NPCs parados | `BUILD SUCCESSFUL`; JAR atualizado copiado para a pasta global `.minecraft/mods`. O log anterior confirmou que Miner retomou a profissão, mas aguardava picareta; a pasta do launcher estava sem o JAR do mod. | Reiniciar o TLauncher para carregar a nova build e observar Storager, Miner e lenhador. |
 | 2026-11-14 | 1.21.10 / Fabric Loader 0.18.0 | `build` após refatoração modular (`ProfessionJob`, `LumberjackJob`), correção de bugs (loop da mina, comandos `go`/`nation`, watchdog teleporte, banner substituível, flood no chat) | `BUILD SUCCESSFUL` gerando `ai-civilization-0.1.0.jar` (copiado para `~/.minecraft/mods`). | Testar novos comandos e comportamento modular no mundo. |
+| 2026-11-14 | 1.21.10 / Fabric Loader 0.18.0 | Blueprints JSON da warehouse 10x10, praça central 7x5 e painel de pedidos pela tecla `K` | `compileJava` e `compileClientJava` passaram. Layout e interface ainda precisam de teste dentro do Minecraft. | Conferir os dois layouts, a entrega de ferramentas e a tela de pedidos no jogo. |
 
 ## Regras de trabalho
 
