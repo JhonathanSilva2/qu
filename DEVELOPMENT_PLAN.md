@@ -49,6 +49,8 @@ O repositório antigo é um bot Mineflayer para Minecraft 1.20.6, conectado ao s
 - [x] Dados de nações e localizações são salvos no Overworld e compartilhados entre dimensões.
 - [x] Sistema de localizações nomeadas: salvar posição atual, listar e remover locais; cidadãos podem receber uma ordem de viagem na mesma dimensão.
 - [x] `/aiciv list` agora inclui `nation` e `location`; `/aiciv help` documenta os comandos novos.
+- [x] `/aiciv create civilization <name>` cria LumberJack, Storager, Miner e Builder na mesma civilização.
+- [x] `/aiciv delete civilization <name>` remove os cidadãos e os dados da nação; estruturas já construídas ficam no mundo.
 - [x] Territórios de nação circulares com raio de 128 blocos; um cidadão invocado dentro entra na nação mais próxima e não atravessa a fronteira de outra.
 - [x] Nações novas recebem nomes de países e um estandarte colorido no centro; `/aiciv list nation` mostra centro, fundador, dimensão e cidadãos.
 - [x] Lenhador agora mira o tronco/folha com o controle de olhar durante o corte, seguindo a mecânica observada no `CompanionMineGoal` do AI Buddies.
@@ -76,6 +78,8 @@ O repositório antigo é um bot Mineflayer para Minecraft 1.20.6, conectado ao s
 - [x] AI Buddies foi inspecionado localmente; Millénaire também foi inspecionado para referências de `VillagerNavDriver`, `WaypointNavigator`, `MiningHandler`, `ChoppingHandler` e diagnóstico de caminhos. TreeChop permanece referência apenas para a queda/coleta de árvores.
 - [x] Watchdog de navegação: se um cidadão com profissão tiver um destino de trabalho e permanecer sem mudar de posição por 200 ticks, ele é levado ao estandarte da cidade, a navegação é reiniciada e o job continua.
 - [x] Lenhador tenta desobstruir a rota e, se continuar sem progresso, abandona temporariamente aquela árvore e procura outra.
+- [x] Busca/aproximação do Lumberjack adapta padrões do `CompanionMineGoal` do AI Buddies: valida o alvo, limita varreduras, testa rotas alcançáveis e evita árvores bloqueadas por um período. A rotina existente de derrubada/queda dos troncos foi mantida.
+- [x] Storager busca troncos adicionais do Lumberjack quando faltam tábuas para completar a receita de ferramentas e gravetos; pedidos de ferramentas seguem com prioridade.
 - [x] Lenhador entrega ao Storager packs de 64 troncos e todos os gravetos, maçãs e mudas coletados; anuncia as quantidades da carga.
 - [x] Sem árvores próximas, lenhador prioriza plantar mudas em locais válidos; se estiver sem mudas, tenta retirar uma do armazém antes de patrulhar.
 - [x] Lenhador procura madeira nas extremidades nomeadas sul, norte, leste e oeste da nação, alternando a fronteira quando a busca local falha.
@@ -100,6 +104,8 @@ O repositório antigo é um bot Mineflayer para Minecraft 1.20.6, conectado ao s
 - [ ] Clicar com botão direito e verificar abertura, retirada e depósito de itens no inventário do NPC.
 - [ ] Verificar se a textura própria renderiza corretamente no jogo e ajustar o atlas se necessário.
 - [ ] Invocar dois cidadãos e confirmar que cada um funda uma nação separada; consultar `/aiciv list nation`.
+- [ ] Usar `/aiciv create civilization Teste` e confirmar quatro NPCs: LumberJack, Storager, Miner e Builder.
+- [ ] Usar `/aiciv delete civilization Teste` e confirmar remoção dos quatro NPCs e dos dados da nação, mantendo as estruturas existentes.
 - [ ] Invocar outro cidadão dentro dos 128 blocos e confirmar que ele entra na nação existente; invocar fora e confirmar novo país/estandarte.
 - [ ] Mandar cidadão seguir/juntar madeira até a borda e confirmar que ele não cruza para território vizinho.
 - [ ] Confirmar que o estandarte aparece no centro e continua depois de salvar/reabrir o mundo.
@@ -121,6 +127,7 @@ O repositório antigo é um bot Mineflayer para Minecraft 1.20.6, conectado ao s
 - [ ] Atribuir um lenhador e consultar `/aiciv storage queue`; confirmar o pedido de machado quando não houver ferramenta disponível.
 - [ ] Entregar um pack de 64 troncos e conferir chegada ao baú de entrada, criação de baús de saída e separação por recurso.
 - [ ] Confirmar que o Storager fabrica e disponibiliza o machado; consultar a fila e o status antes e depois do atendimento.
+- [ ] Sem machado e com o Storager ativo, confirmar pedido, coleta de troncos quando faltarem tábuas, fabricação e retirada do machado pelo Lumberjack.
 - [ ] Testar baú cheio, falta de material para baú, ausência de machado e inventário do lenhador cheio.
 - [ ] Salvar e reabrir o mundo com cidadãos trabalhando; confirmar que Miner e Storager retomam suas rotinas.
 - [ ] Confirmar que os três tipos de profissão caminham após a correção do atributo de movimento e retomam após fechar/reabrir o mundo.

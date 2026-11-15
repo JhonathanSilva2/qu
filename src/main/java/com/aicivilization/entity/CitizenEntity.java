@@ -319,6 +319,11 @@ public class CitizenEntity extends PathfinderMob {
     public void tick() {
         super.tick();
         if (!this.level().isClientSide() && this.level() instanceof ServerLevel serverLevel && nationId != null) {
+            if (CivilizationData.get(serverLevel).getNation(nationId) == null) {
+                stopProfession();
+                discard();
+                return;
+            }
             if (!enforceNationBoundary(serverLevel)) return;
         }
         if (travelTarget != null && !this.level().isClientSide()) {

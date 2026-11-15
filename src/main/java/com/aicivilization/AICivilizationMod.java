@@ -47,7 +47,8 @@ public class AICivilizationMod implements ModInitializer {
         "/aiciv list npc — lista NPCs carregados na dimensão atual; o número é o slot",
         "/aiciv list job — lista profissões disponíveis",
         "/aiciv list nation — lista nações e seus fundadores",
-        "/aiciv create civilization <name> — cria a civilização com LumberJack, Storager e Miner",
+        "/aiciv create civilization <name> — cria a civilização com LumberJack, Storager, Miner e Builder",
+        "/aiciv delete civilization <name> — remove uma civilização e seus cidadãos",
         "/aiciv nation size — mostra o raio dos territórios em blocos",
         "/aiciv list location — lista locais salvos no mundo",
         "/aiciv list warehouse — mostra os armazéns das nações",
@@ -157,6 +158,11 @@ public class AICivilizationMod implements ModInitializer {
                         .then(Commands.argument("name", StringArgumentType.string())
                             .executes(context -> createCivilization(context.getSource().getPlayerOrException(),
                                 getString(context, "name"))))))
+                .then(Commands.literal("delete")
+                    .then(Commands.literal("civilization")
+                        .then(Commands.argument("name", StringArgumentType.string())
+                            .executes(context -> deleteCivilization(context.getSource().getPlayerOrException(),
+                                getString(context, "name"))))))
                 .then(Commands.literal("location")
                     .then(Commands.literal("set")
                         .then(Commands.argument("name", StringArgumentType.word())
@@ -264,8 +270,8 @@ public class AICivilizationMod implements ModInitializer {
         }
 
         List<BlockPos> spawnPositions = findCivilizationSpawnPositions(level, center);
-        if (spawnPositions.size() < 3) {
-            player.sendSystemMessage(ChatMessages.error("Não encontrei três pontos seguros para os cidadãos."));
+        if (spawnPositions.size() < 4) {
+            player.sendSystemMessage(ChatMessages.error("Não encontrei quatro pontos seguros para os cidadãos."));
             return 0;
         }
 
@@ -310,12 +316,13 @@ public class AICivilizationMod implements ModInitializer {
 
         boolean jobsStarted = citizens.get(0).startLumberjack()
             && citizens.get(1).startStorage()
-            && citizens.get(2).startMiner();
+            && citizens.get(2).startMiner()
+            && citizens.get(3).startBuilder();
         if (!jobsStarted) {
             citizens.forEach(Entity::discard);
             level.setBlockAndUpdate(center, Blocks.AIR.defaultBlockState());
             data.removeNation(nation.id());
-            player.sendSystemMessage(ChatMessages.error("A civilização não pôde iniciar os três trabalhos; tente em outra área."));
+            player.sendSystemMessage(ChatMessages.error("A civilização não pôde iniciar os quatro trabalhos; tente em outra área."));
             return 0;
         }
         citizens.getFirst().announce("Fundei " + nation.name() + "! Nossa equipe já está trabalhando.");
@@ -323,7 +330,38 @@ public class AICivilizationMod implements ModInitializer {
         player.sendSystemMessage(ChatMessages.info(citizens.get(0).getPersonalName() + " foi criado como LumberJack."));
         player.sendSystemMessage(ChatMessages.info(citizens.get(1).getPersonalName() + " foi criado como Storager."));
         player.sendSystemMessage(ChatMessages.info(citizens.get(2).getPersonalName() + " foi criado como Miner."));
+        player.sendSystemMessage(ChatMessages.info(citizens.get(3).getPersonalName() + " foi criado como Builder."));
         return 1;
+    }
+
+    private int deleteCivilization(ServerPlayer player, String name) {
+        String requestedName = name.trim();
+        ServerLevel currentLevel = (ServerLevel) player.level();
+        CivilizationData data = CivilizationData.get(currentLevel);
+        CivilizationData.Nation nation = data.nations().stream()
+            .filter(candidate -> candidate.name().equalsIgnoreCase(requestedName))
+            .findFirst().orElse(null);
+        if (nation == null) {
+            player.sendSystemMessage(ChatMessages.error("Civilization '" + requestedName + "' was not found."));
+            return 0;
+        }
+
+        List<UUID> citizenIds = List.copyOf(nation.citizens());
+        for (ServerLevel serverLevel : currentLevel.getServer().getAllLevels()) {
+            for (UUID citizenId : citizenIds) {
+                Entity entity = serverLevel.getEntity(citizenId);
+                if (entity instanceof CitizenEntity citizen) {
+                    citizen.stopProfession();
+                    citizen.discard();
+                }
+            }
+        }
+        SELECTED_NPCS.entrySet().removeIf(entry -> citizenIds.contains(entry.getValue()));
+        DEBUG_WATCHES.entrySet().removeIf(entry -> citizenIds.contains(entry.getValue().citizenId()));
+        data.removeNation(nation.id());
+        player.sendSystemMessage(ChatMessages.success("Civilization '" + nation.name()
+            + "' deleted; its citizens and saved data were removed. Built blocks were kept."));
+        return citizenIds.size();
     }
 
     private BlockPos findSafeCivilizationCenter(ServerLevel level, BlockPos around) {
@@ -345,9 +383,9 @@ public class AICivilizationMod implements ModInitializer {
 
     private List<BlockPos> findCivilizationSpawnPositions(ServerLevel level, BlockPos center) {
         List<BlockPos> positions = new ArrayList<>();
-        for (int radius = 2; radius <= 5 && positions.size() < 3; radius++) {
-            for (int dx = -radius; dx <= radius && positions.size() < 3; dx++) {
-                for (int dz = -radius; dz <= radius && positions.size() < 3; dz++) {
+        for (int radius = 2; radius <= 6 && positions.size() < 4; radius++) {
+            for (int dx = -radius; dx <= radius && positions.size() < 4; dx++) {
+                for (int dz = -radius; dz <= radius && positions.size() < 4; dz++) {
                     if (Math.max(Math.abs(dx), Math.abs(dz)) != radius) continue;
                     int x = center.getX() + dx;
                     int z = center.getZ() + dz;
