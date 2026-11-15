@@ -48,6 +48,7 @@ public final class StorageJob implements ProfessionJob {
         new ToolRecipe(Items.WOODEN_AXE, null, true)
     );
     private static final List<ToolRecipe> PICKAXE_RECIPES = List.of(
+        new ToolRecipe(Items.NETHERITE_PICKAXE, Items.NETHERITE_INGOT, false),
         new ToolRecipe(Items.DIAMOND_PICKAXE, Items.DIAMOND, false),
         new ToolRecipe(Items.IRON_PICKAXE, Items.IRON_INGOT, false),
         new ToolRecipe(Items.STONE_PICKAXE, Items.COBBLESTONE, false),
@@ -420,6 +421,7 @@ public final class StorageJob implements ProfessionJob {
     }
 
     private static int pickaxeTier(Item pickaxe) {
+        if (pickaxe == Items.NETHERITE_PICKAXE) return 4;
         if (pickaxe == Items.DIAMOND_PICKAXE) return 3;
         if (pickaxe == Items.IRON_PICKAXE) return 2;
         if (pickaxe == Items.STONE_PICKAXE) return 1;
@@ -541,7 +543,7 @@ public final class StorageJob implements ProfessionJob {
     private int parseRequestedPickaxeTier(String requestId) {
         String prefix = BEST_PICKAXE_REQUEST_ID + ".tier_";
         try {
-            return Math.max(0, Math.min(3, Integer.parseInt(requestId.substring(prefix.length()))));
+            return Math.max(0, Math.min(4, Integer.parseInt(requestId.substring(prefix.length()))));
         } catch (NumberFormatException exception) {
             return 0;
         }
@@ -911,7 +913,45 @@ public final class StorageJob implements ProfessionJob {
             .findFirst().orElse(null);
     }
 
-    private static List<BlockPos> findChests(ServerLevel level, CivilizationData.Warehouse warehouse) {
+    public static boolean depositAllResources(CitizenEntity citizen, ServerLevel level) {
+        CivilizationData.Warehouse warehouse = CivilizationData.get(level).warehouse(citizen.getNationId());
+        if (warehouse == null || !warehouse.dimension().equals(level.dimension().location())) return false;
+        List<BlockPos> chests = findChests(level, warehouse);
+        if (chests.isEmpty()) return false;
+
+        boolean depositedAny = false;
+        for (int slot = 0; slot < citizen.getNpcInventory().getContainerSize(); slot++) {
+            ItemStack stack = citizen.getNpcInventory().getItem(slot);
+            if (stack.isEmpty()) continue;
+            Item item = stack.getItem();
+            if (item == Items.TORCH
+                || item == Items.NETHERITE_PICKAXE || item == Items.DIAMOND_PICKAXE
+                || item == Items.IRON_PICKAXE || item == Items.STONE_PICKAXE
+                || item == Items.WOODEN_PICKAXE || item == Items.NETHERITE_AXE
+                || item == Items.DIAMOND_AXE || item == Items.IRON_AXE
+                || item == Items.STONE_AXE || item == Items.WOODEN_AXE) continue;
+
+            for (BlockPos chestPos : chests) {
+                if (level.getBlockEntity(chestPos) instanceof ChestBlockEntity chest && canFit(chest, stack)) {
+                    ItemStack remainder = insert(chest, stack.copy());
+                    int moved = stack.getCount() - remainder.getCount();
+                    if (moved > 0) {
+                        stack.shrink(moved);
+                        if (stack.isEmpty()) citizen.getNpcInventory().setItem(slot, ItemStack.EMPTY);
+                        chest.setChanged();
+                        depositedAny = true;
+                    }
+                    if (stack.isEmpty()) break;
+                }
+            }
+        }
+        if (depositedAny) {
+            citizen.getNpcInventory().setChanged();
+        }
+        return depositedAny;
+    }
+
+    public static List<BlockPos> findChests(ServerLevel level, CivilizationData.Warehouse warehouse) {
         List<BlockPos> result = new ArrayList<>();
         BlockPos center = warehouse.center();
         int radius = warehouse.radius();
@@ -946,7 +986,7 @@ public final class StorageJob implements ProfessionJob {
         return capacity >= stack.getCount();
     }
 
-    private static boolean canFit(Container container, ItemStack incoming) {
+    public static boolean canFit(Container container, ItemStack incoming) {
         int space = 0;
         for (int i = 0; i < container.getContainerSize(); i++) {
             ItemStack current = container.getItem(i);
@@ -957,7 +997,7 @@ public final class StorageJob implements ProfessionJob {
         return false;
     }
 
-    private static ItemStack insert(Container container, ItemStack incoming) {
+    public static ItemStack insert(Container container, ItemStack incoming) {
         ItemStack remaining = incoming.copy();
         for (int i = 0; i < container.getContainerSize() && !remaining.isEmpty(); i++) {
             ItemStack current = container.getItem(i);

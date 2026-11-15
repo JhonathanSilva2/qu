@@ -38,10 +38,10 @@ public final class MinerJob implements ProfessionJob {
     public static final String LABEL = "Miner";
 
     private static final int WIDTH = 7;
-    private static final int HEIGHT = 3;
+    private static final int HEIGHT = 6;
     private static final int MAX_DEPTH = 72;
     private static final List<Item> PICKAXES = List.of(
-        Items.DIAMOND_PICKAXE, Items.IRON_PICKAXE, Items.STONE_PICKAXE, Items.WOODEN_PICKAXE
+        Items.NETHERITE_PICKAXE, Items.DIAMOND_PICKAXE, Items.IRON_PICKAXE, Items.STONE_PICKAXE, Items.WOODEN_PICKAXE
     );
     private static final List<String> START_PHRASES = List.of(
         "Bora trabalhar!", "Picareta afiada, vamos nessa.", "Iniciando escavação."
@@ -220,10 +220,34 @@ public final class MinerJob implements ProfessionJob {
             return false;
         }
 
+        // Descarregar recursos ao voltar à base para que o Storager possa fabricar ferramentas
+        if (StorageJob.depositAllResources(citizen, level)) {
+            citizen.announce("Descarreguei meus recursos no armazém para fabricarem novas ferramentas.");
+        }
+
         // Do not restart a path to a chest every work tick. Check again when the current
         // path finishes, or immediately while standing at the base.
-        if (citizen.getNavigation().isDone()
-            && StorageJob.retrieveBestPickaxe(citizen, level, minimumTier)) return false;
+        if (citizen.getNavigation().isDone()) {
+            if (StorageJob.retrieveBestPickaxe(citizen, level, minimumTier)) return false;
+            // Se não encontrou a picareta ideal, pega qualquer picareta disponível no baú
+            if (minimumTier > 0 && StorageJob.retrieveBestPickaxe(citizen, level, 0)) {
+                requestedPickaxeTier = 0;
+                toolPickupPending = false;
+                citizen.announce("Não encontrei a picareta ideal, mas peguei uma reserva no baú para continuar minerando.");
+                return false;
+            }
+        }
+
+        // Se tiver qualquer picareta no inventário (mesmo tier menor), equipa e vai minerar
+        Item fallbackInventoryPickaxe = bestInventoryPickaxe(citizen, 0);
+        if (fallbackInventoryPickaxe != null) {
+            citizen.setItemSlot(EquipmentSlot.MAINHAND, citizen.getNpcInventory().removeItemType(fallbackInventoryPickaxe, 1));
+            toolPickupPending = false;
+            toolLookupCooldown = 0;
+            requestedPickaxeTier = 0;
+            citizen.announce("Equipei uma picareta reserva do meu inventário e voltei ao trabalho.");
+            return true;
+        }
 
         if (toolLookupCooldown <= 0) {
             CivilizationData.get(level).requestStorageItem(citizen.getNationId(), citizen.getUUID(),
@@ -425,6 +449,27 @@ public final class MinerJob implements ProfessionJob {
             entranceMarked = false;
             return;
         }
+
+        // Se a civilização já tem uma mina registrada, o minerador se junta a ela!
+        CivilizationData.MineSite existing = data.getMineSite(nation.id());
+        if (existing != null && existing.dimension().equals(level.dimension().location())) {
+            mineOrigin = existing.origin();
+            direction = existing.direction();
+            entranceMarked = true;
+            // Sincroniza o degrau com outro minerador da mesma mina
+            List<CitizenEntity> citizens = level.getEntitiesOfClass(CitizenEntity.class, citizen.getBoundingBox().inflate(128.0));
+            for (CitizenEntity other : citizens) {
+                if (other != citizen && nation.id().equals(other.getNationId()) && other.isMinerEnabled()) {
+                    MinerJob otherJob = other.getMinerJob();
+                    if (otherJob != null && otherJob.getMineOrigin() != null && otherJob.getMineOrigin().equals(mineOrigin)) {
+                        this.step = Math.max(this.step, otherJob.getStep());
+                    }
+                }
+            }
+            citizen.announce("Juntei-me à mina existente da nossa civilização.");
+            return;
+        }
+
         BlockPos base = basePosition(citizen, level);
         int baseY = base.getY();
 
@@ -469,12 +514,14 @@ public final class MinerJob implements ProfessionJob {
             if (!level.getBlockState(below).isFaceSturdy(level, below, Direction.UP)) {
                 level.setBlockAndUpdate(below, Blocks.COBBLESTONE.defaultBlockState());
             }
+            data.setMineSite(nation.id(), mineOrigin, direction, level.dimension().location());
             return;
         }
 
         mineOrigin = new BlockPos(citizen.blockPosition().getX(), baseY, citizen.blockPosition().getZ());
         direction = Direction.SOUTH;
         entranceMarked = false;
+        data.setMineSite(nation.id(), mineOrigin, direction, level.dimension().location());
     }
 
     private List<BlockPos> currentSlice() {
@@ -655,6 +702,7 @@ public final class MinerJob implements ProfessionJob {
     }
 
     private int pickaxeTier(Item item) {
+        if (item == Items.NETHERITE_PICKAXE) return 4;
         if (item == Items.DIAMOND_PICKAXE) return 3;
         if (item == Items.IRON_PICKAXE) return 2;
         if (item == Items.STONE_PICKAXE) return 1;

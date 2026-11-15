@@ -3,6 +3,7 @@ package com.aicivilization.data;
 import com.mojang.serialization.Codec;
 import com.mojang.serialization.codecs.RecordCodecBuilder;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.core.UUIDUtil;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.resources.ResourceLocation;
@@ -67,12 +68,21 @@ public final class CivilizationData extends SavedData {
         UUIDUtil.CODEC.fieldOf("nation").forGetter(StoragerClaim::nationId),
         UUIDUtil.CODEC.fieldOf("citizen").forGetter(StoragerClaim::citizenId)
     ).apply(instance, StoragerClaim::new));
+    private static final Codec<MineSite> MINE_SITE_CODEC = RecordCodecBuilder.create(instance -> instance.group(
+        UUIDUtil.CODEC.fieldOf("nation").forGetter(MineSite::nationId),
+        Codec.INT.fieldOf("x").forGetter(MineSite::x),
+        Codec.INT.fieldOf("y").forGetter(MineSite::y),
+        Codec.INT.fieldOf("z").forGetter(MineSite::z),
+        Codec.INT.fieldOf("direction2D").forGetter(MineSite::direction2D),
+        ResourceLocation.CODEC.fieldOf("dimension").forGetter(MineSite::dimension)
+    ).apply(instance, MineSite::new));
     private static final Codec<CivilizationData> CODEC = RecordCodecBuilder.create(instance -> instance.group(
         LOCATION_CODEC.listOf().fieldOf("locations").forGetter(data -> data.locations.values().stream().toList()),
         NATION_CODEC.listOf().fieldOf("nations").forGetter(data -> data.nations.values().stream().toList()),
         WAREHOUSE_CODEC.listOf().optionalFieldOf("warehouses", List.of()).forGetter(data -> data.warehouses.values().stream().toList()),
         STORAGE_REQUEST_CODEC.listOf().optionalFieldOf("storageRequests", List.of()).forGetter(data -> data.storageRequests.values().stream().toList()),
-        STORAGER_CLAIM_CODEC.listOf().optionalFieldOf("storagerClaims", List.of()).forGetter(data -> data.storagerClaims.values().stream().toList())
+        STORAGER_CLAIM_CODEC.listOf().optionalFieldOf("storagerClaims", List.of()).forGetter(data -> data.storagerClaims.values().stream().toList()),
+        MINE_SITE_CODEC.listOf().optionalFieldOf("mineSites", List.of()).forGetter(data -> data.mineSites.values().stream().toList())
     ).apply(instance, CivilizationData::new));
     public static final SavedDataType<CivilizationData> TYPE = new SavedDataType<>(
         "ai_civilization", CivilizationData::new, CODEC, null
@@ -83,17 +93,19 @@ public final class CivilizationData extends SavedData {
     private final Map<UUID, Warehouse> warehouses = new LinkedHashMap<>();
     private final Map<UUID, StorageRequest> storageRequests = new LinkedHashMap<>();
     private final Map<UUID, StoragerClaim> storagerClaims = new LinkedHashMap<>();
+    private final Map<UUID, MineSite> mineSites = new LinkedHashMap<>();
 
     private CivilizationData() {}
 
     private CivilizationData(List<SavedLocation> locations, List<Nation> nations,
                              List<Warehouse> warehouses, List<StorageRequest> storageRequests,
-                             List<StoragerClaim> storagerClaims) {
+                             List<StoragerClaim> storagerClaims, List<MineSite> mineSites) {
         locations.forEach(location -> this.locations.put(key(location.name()), location));
         nations.forEach(nation -> this.nations.put(nation.id(), nation));
         warehouses.forEach(warehouse -> this.warehouses.put(warehouse.nationId(), warehouse));
         storageRequests.forEach(request -> this.storageRequests.put(request.id(), request));
         storagerClaims.forEach(claim -> this.storagerClaims.put(claim.nationId(), claim));
+        mineSites.forEach(site -> this.mineSites.put(site.nationId(), site));
     }
 
     public static CivilizationData get(ServerLevel level) {
@@ -299,5 +311,23 @@ public final class CivilizationData extends SavedData {
         }
 
         public BlockPos center() { return new BlockPos(x, y, z); }
+    }
+
+    public MineSite getMineSite(UUID nationId) {
+        return nationId == null ? null : mineSites.get(nationId);
+    }
+
+    public MineSite setMineSite(UUID nationId, BlockPos origin, Direction direction, ResourceLocation dimension) {
+        if (nationId == null || origin == null) return null;
+        MineSite site = new MineSite(nationId, origin.getX(), origin.getY(), origin.getZ(),
+            direction.get2DDataValue(), dimension);
+        mineSites.put(nationId, site);
+        setDirty();
+        return site;
+    }
+
+    public record MineSite(UUID nationId, int x, int y, int z, int direction2D, ResourceLocation dimension) {
+        public BlockPos origin() { return new BlockPos(x, y, z); }
+        public Direction direction() { return Direction.from2DDataValue(direction2D); }
     }
 }
