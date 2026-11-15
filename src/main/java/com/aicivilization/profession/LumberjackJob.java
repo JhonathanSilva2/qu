@@ -191,6 +191,12 @@ public final class LumberjackJob implements ProfessionJob {
 
     @Override
     public boolean needsNavigation(CitizenEntity citizen, ServerLevel level) {
+        if (phase == WorkPhase.DELIVERING || phase == WorkPhase.WAITING_FOR_TOOL || phase == WorkPhase.WAITING_FOR_SAPLING) {
+            CivilizationData.Warehouse warehouse = CivilizationData.get(level).warehouse(citizen.getNationId());
+            if (warehouse != null && warehouse.dimension().equals(level.dimension().location())) {
+                return !StorageJob.isCitizenInsideWarehouse(citizen, warehouse);
+            }
+        }
         BlockPos destination = plannedApproach != null ? plannedApproach : lumberjackTarget;
         return destination != null && citizen.distanceToSqr(destination.getX() + 0.5, destination.getY(),
             destination.getZ() + 0.5) > 9.0;
@@ -215,7 +221,7 @@ public final class LumberjackJob implements ProfessionJob {
         }
         replantAvailableSaplings(citizen, level);
 
-        if (StorageJob.hasLumberjackDeliveryResources(citizen)) {
+        if (lumberjackDeliveryPending || StorageJob.hasLumberjackDeliveryResources(citizen)) {
             phase = WorkPhase.DELIVERING;
             if (!lumberjackDeliveryPending) {
                 citizen.announce(StorageJob.lumberjackDeliveryMessage(citizen));

@@ -118,7 +118,14 @@ public final class StorageJob implements ProfessionJob {
     @Override
     public boolean needsNavigation(CitizenEntity citizen, ServerLevel level) {
         CivilizationData.Warehouse warehouse = CivilizationData.get(level).warehouse(citizen.getNationId());
-        return warehouse != null && citizen.distanceToSqr(warehouse.x() + 0.5, warehouse.y(), warehouse.z() + 0.5) > 196.0;
+        return warehouse != null && !isCitizenInsideWarehouse(citizen, warehouse);
+    }
+
+    public static boolean isCitizenInsideWarehouse(CitizenEntity citizen, CivilizationData.Warehouse warehouse) {
+        if (warehouse == null) return false;
+        int halfSize = Math.max(6, warehouse.radius() / 2);
+        return Math.abs(citizen.getBlockX() - warehouse.x()) <= halfSize
+            && Math.abs(citizen.getBlockZ() - warehouse.z()) <= halfSize;
     }
 
     @Override
@@ -141,25 +148,96 @@ public final class StorageJob implements ProfessionJob {
         if (current != null && current.dimension().equals(level.dimension().location())
             && outsideStandardExclusion(current.center(), nation)) return true;
 
-        int[][] directions = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}, {1, 1}, {1, -1}, {-1, 1}, {-1, -1}};
-        int[] distances = {24, 32, 40, 48};
+        // Cardinal directions first (East, West, South, North) so the warehouse aligns directly with the town center roads!
+        int[][] directions = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+        int[] distances = {15, 18, 22};
+        BlockPos bestCandidate = null;
+        int bestScore = Integer.MAX_VALUE;
+
         for (int distance : distances) {
             for (int[] direction : directions) {
                 int x = nation.x() + direction[0] * distance;
                 int z = nation.z() + direction[1] * distance;
                 BlockPos probe = new BlockPos(x, nation.y(), z);
                 if (!level.hasChunkAt(probe)) continue;
-                int y = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
-                BlockPos candidate = new BlockPos(x, y, z);
-                if (!outsideStandardExclusion(candidate, nation) || !level.getBlockState(candidate).isAir()
-                    || !level.getBlockState(candidate.below()).isFaceSturdy(level, candidate.below(), Direction.UP)) continue;
-                if (!nation.contains(candidate.offset(12, 0, 0)) || !nation.contains(candidate.offset(-12, 0, 0))
-                    || !nation.contains(candidate.offset(0, 0, 12)) || !nation.contains(candidate.offset(0, 0, -12))) continue;
-                data.setWarehouse(nation.id(), candidate, 12, level.dimension().location());
-                return true;
+                int optimalY = computeOptimalWarehouseSurfaceY(level, x, z, nation.y());
+                BlockPos candidate = new BlockPos(x, optimalY, z);
+                if (!outsideStandardExclusion(candidate, nation)) continue;
+                if (!nation.contains(candidate.offset(10, 0, 0)) || !nation.contains(candidate.offset(-10, 0, 0))
+                    || !nation.contains(candidate.offset(0, 0, 10)) || !nation.contains(candidate.offset(0, 0, -10))) continue;
+
+                int score = evaluateWarehouseSiteScore(level, candidate) + (distance - 15) * 8;
+                if (score < bestScore) {
+                    bestScore = score;
+                    bestCandidate = candidate;
+                }
             }
+            if (bestCandidate != null && distance == 15) break; // Prioritize 15 blocks away!
+        }
+        if (bestCandidate != null) {
+            data.setWarehouse(nation.id(), bestCandidate, 12, level.dimension().location());
+            return true;
         }
         return false;
+    }
+
+    /** Millénaire-style dominant terrain height calculation: picks the modal (most frequent) natural ground Y in the 10x10 plot. */
+    private static int computeOptimalWarehouseSurfaceY(ServerLevel level, int centerX, int centerZ, int fallbackY) {
+        java.util.Map<Integer, Integer> heightFrequency = new java.util.HashMap<>();
+        int bestGroundY = fallbackY - 1;
+        int bestCount = 0;
+
+        for (int dx = -5; dx < 5; dx++) {
+            for (int dz = -5; dz < 5; dz++) {
+                int x = centerX + dx;
+                int z = centerZ + dz;
+                if (!level.hasChunkAt(new BlockPos(x, fallbackY, z))) continue;
+                int topY = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z) - 1;
+                // Walk down past tree logs or clearable vegetation to find the true terrain ground
+                while (topY > level.getMinY() + 5) {
+                    BlockPos pos = new BlockPos(x, topY, z);
+                    BlockState state = level.getBlockState(pos);
+                    if (state.is(BlockTags.LOGS) || com.aicivilization.profession.BuilderJob.isClearableVegetation(state)) {
+                        topY--;
+                    } else {
+                        break;
+                    }
+                }
+                int count = heightFrequency.merge(topY, 1, Integer::sum);
+                if (count > bestCount) {
+                    bestCount = count;
+                    bestGroundY = topY;
+                }
+            }
+        }
+        return bestGroundY + 1;
+    }
+
+    private static int evaluateWarehouseSiteScore(ServerLevel level, BlockPos center) {
+        int score = 0;
+        int targetGroundY = center.getY() - 1;
+        for (int dx = -5; dx < 5; dx++) {
+            for (int dz = -5; dz < 5; dz++) {
+                int x = center.getX() + dx;
+                int z = center.getZ() + dz;
+                BlockPos p = new BlockPos(x, center.getY(), z);
+                if (!level.hasChunkAt(p)) {
+                    score += 50;
+                    continue;
+                }
+                int groundY = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z) - 1;
+                BlockPos groundPos = new BlockPos(x, groundY, z);
+                BlockState state = level.getBlockState(groundPos);
+                if (state.is(BlockTags.LOGS)) {
+                    score += 25; // Penalize trees inside the 10x10 plot
+                } else if (!level.getFluidState(groundPos).isEmpty()) {
+                    score += 20; // Penalize water/lava
+                } else {
+                    score += Math.abs(groundY - targetGroundY) * 2; // Prefer flatter terrain
+                }
+            }
+        }
+        return score;
     }
 
     private static boolean outsideStandardExclusion(BlockPos pos, CivilizationData.Nation nation) {
@@ -178,19 +256,7 @@ public final class StorageJob implements ProfessionJob {
             citizen.announce("Estou definindo o armazém de " + citizen.getNationName() + " nesta área.");
         }
         if (!warehouse.dimension().equals(level.dimension().location())) return;
-        boolean atDonor = false;
-        if (resourceDonorId != null) {
-            Entity donorEntity = level.getEntity(resourceDonorId);
-            if (donorEntity instanceof CitizenEntity donor && donor.getNationId().equals(nationId)) {
-                if (citizen.distanceToSqr(donor) > 16.0) {
-                    if (citizen.getNavigation().isDone()) citizen.getNavigation().moveTo(donor, 0.9);
-                    return;
-                }
-                atDonor = true;
-            } else {
-                resourceDonorId = null;
-            }
-        }
+        resourceDonorId = null;
         List<BlockPos> chests = findChests(level, warehouse);
         boolean validInbox = warehouse.hasInbox()
             && level.getBlockEntity(warehouse.inbox()) instanceof ChestBlockEntity;
@@ -199,7 +265,7 @@ public final class StorageJob implements ProfessionJob {
             boolean firstRequest = !data.warehousePlotRequested(nationId);
             data.requestWarehousePlot(nationId);
             if (firstRequest) citizen.announce("Solicitei ao Builder um terreno plano de 10x10 para começar a warehouse.");
-            if (!atDonor && citizen.distanceToSqr(warehouse.x() + 0.5, warehouse.y(), warehouse.z() + 0.5) > 196.0) {
+            if (!isCitizenInsideWarehouse(citizen, warehouse)) {
                 if (citizen.getNavigation().isDone())
                     citizen.getNavigation().moveTo(warehouse.x() + 0.5, warehouse.y(), warehouse.z() + 0.5, 0.9);
                 return;
@@ -210,7 +276,7 @@ public final class StorageJob implements ProfessionJob {
             if (chests.isEmpty()) takeLogsFromNearbyCitizen(citizen, level, warehouse, 2);
             return;
         }
-        if (!atDonor && citizen.distanceToSqr(warehouse.x() + 0.5, warehouse.y(), warehouse.z() + 0.5) > 196.0) {
+        if (!isCitizenInsideWarehouse(citizen, warehouse)) {
             if (citizen.getNavigation().isDone())
                 citizen.getNavigation().moveTo(warehouse.x() + 0.5, warehouse.y(), warehouse.z() + 0.5, 0.9);
             return;
@@ -231,6 +297,8 @@ public final class StorageJob implements ProfessionJob {
         // Tool requests have priority over sorting incoming resources. Their materials can
         // still be counted in the inbox, so the Storager can craft before moving the items.
         if (processRequests(citizen, level, data, warehouse, chests, inbox)) return;
+        // When no open requests are pending, flush excess personal inventory into warehouse chests so Storager never gets full!
+        depositExcessStoragerInventory(citizen, level, chests);
         if (chests.size() < 2 && hasPendingSort((ChestBlockEntity) level.getBlockEntity(inbox))) {
             if (!buildChest(citizen, level, warehouse, chests, false)) return;
             chests = findChests(level, warehouse);
@@ -318,86 +386,203 @@ public final class StorageJob implements ProfessionJob {
     }
 
     public static boolean hasLumberjackDeliveryResources(CitizenEntity citizen) {
+        int totalLogs = 0;
+        int secondaryCount = 0;
+        int emptySlots = 0;
+        for (int slot = 0; slot < citizen.getNpcInventory().getContainerSize(); slot++) {
+            ItemStack stack = citizen.getNpcInventory().getItem(slot);
+            if (stack.isEmpty()) {
+                emptySlots++;
+                continue;
+            }
+            if (stack.is(ItemTags.LOGS)) totalLogs += stack.getCount();
+            else if (isLumberjackSecondaryResource(stack)) secondaryCount += stack.getCount();
+        }
+        // Trigger delivery when the Lumberjack has a solid batch of wood (>= 24 logs),
+        // OR when his inventory is nearly full (< 3 empty slots) and he has cargo to deliver!
+        // Never stop chopping after 1 single tree just because 1 stick or sapling dropped!
+        return totalLogs >= 24 || (emptySlots < 3 && (totalLogs > 0 || secondaryCount > 0));
+    }
+
+    public static boolean hasAnyDeliverableLumberjackCargo(CitizenEntity citizen) {
+        int saplingsSeen = 0;
         for (int slot = 0; slot < citizen.getNpcInventory().getContainerSize(); slot++) {
             ItemStack stack = citizen.getNpcInventory().getItem(slot);
             if (stack.isEmpty()) continue;
-            if (stack.is(ItemTags.LOGS) && stack.getCount() >= 64) return true;
-            if (isLumberjackSecondaryResource(stack)) return true;
+            if (stack.is(ItemTags.LOGS) || stack.is(Items.STICK) || stack.is(Items.APPLE)) return true;
+            if (isSapling(stack)) {
+                saplingsSeen += stack.getCount();
+                if (saplingsSeen > 8) return true; // Keep up to 8 saplings for replanting
+            }
         }
         return false;
     }
 
     public static String lumberjackDeliveryMessage(CitizenEntity citizen) {
-        int logPacks = 0;
+        int totalLogs = 0;
         int sticks = 0;
         int apples = 0;
         int saplings = 0;
         for (int slot = 0; slot < citizen.getNpcInventory().getContainerSize(); slot++) {
             ItemStack stack = citizen.getNpcInventory().getItem(slot);
-            if (stack.is(ItemTags.LOGS)) logPacks += stack.getCount() / 64;
+            if (stack.is(ItemTags.LOGS)) totalLogs += stack.getCount();
             else if (stack.is(Items.STICK)) sticks += stack.getCount();
             else if (stack.is(Items.APPLE)) apples += stack.getCount();
             else if (isSapling(stack)) saplings += stack.getCount();
         }
         List<String> cargo = new ArrayList<>();
-        if (logPacks > 0) cargo.add(logPacks + (logPacks == 1 ? " pack de madeira" : " packs de madeira"));
+        if (totalLogs > 0) cargo.add(totalLogs + "x troncos de madeira");
         if (sticks > 0) cargo.add(sticks + "x gravetos");
         if (apples > 0) cargo.add(apples + (apples == 1 ? "x maçã" : "x maçãs"));
-        if (saplings > 0) cargo.add(saplings + (saplings == 1 ? "x muda" : "x mudas"));
-        return "Entregando " + String.join(", ", cargo) + " ao Storager.";
+        if (saplings > 8) cargo.add((saplings - 8) + ((saplings - 8) == 1 ? "x muda" : "x mudas"));
+        return "Voltando para a Warehouse entregar " + String.join(", ", cargo) + ".";
     }
 
     /** Returns true while walking to the warehouse or while deliverable resources remain. */
     public static boolean deliverLumberjackResources(CitizenEntity citizen, ServerLevel level) {
-        if (!hasLumberjackDeliveryResources(citizen)) return false;
-        CivilizationData.Warehouse warehouse = CivilizationData.get(level).warehouse(citizen.getNationId());
-        if (warehouse == null || !warehouse.dimension().equals(level.dimension().location())) return true;
+        if (!hasAnyDeliverableLumberjackCargo(citizen)) return false;
+        CivilizationData data = CivilizationData.get(level);
+        CivilizationData.Warehouse warehouse = data.warehouse(citizen.getNationId());
+        if (warehouse == null || !warehouse.dimension().equals(level.dimension().location())) return false;
+
+        List<BlockPos> allChests = findChests(level, warehouse);
         BlockPos inbox = warehouse.inbox();
-        if (inbox == null || !(level.getBlockEntity(inbox) instanceof ChestBlockEntity chest)) {
-            citizen.getNavigation().moveTo(warehouse.x() + 0.5, warehouse.y(), warehouse.z() + 0.5, 0.9);
-            return true;
+        boolean hasValidInbox = inbox != null && level.getBlockEntity(inbox) instanceof ChestBlockEntity;
+
+        // If no chests exist yet in the Warehouse, walk inside and hand resources directly to the Storager!
+        if (!hasValidInbox && allChests.isEmpty()) {
+            if (!isCitizenInsideWarehouse(citizen, warehouse)) {
+                if (citizen.getNavigation().isDone()) {
+                    citizen.getNavigation().moveTo(warehouse.x() + 0.5, warehouse.y(), warehouse.z() + 0.5, 0.95);
+                }
+                return true;
+            }
+            UUID storagerId = data.storager(citizen.getNationId());
+            if (storagerId != null && level.getEntity(storagerId) instanceof CitizenEntity storager
+                && storager != citizen && citizen.getNationId().equals(storager.getNationId())) {
+                if (citizen.distanceToSqr(storager) > 16.0) {
+                    if (citizen.getNavigation().isDone()) citizen.getNavigation().moveTo(storager, 0.95);
+                    return true;
+                }
+                int totalTransferred = transferLumberjackCargoToContainer(citizen, storager.getNpcInventory());
+                if (totalTransferred > 0) {
+                    citizen.getNpcInventory().setChanged();
+                    storager.getNpcInventory().setChanged();
+                    citizen.announce("Entreguei " + totalTransferred + " recursos diretamente ao Storager na Warehouse.");
+                }
+            }
+            return false;
         }
-        if (citizen.distanceToSqr(inbox.getX() + 0.5, inbox.getY(), inbox.getZ() + 0.5) > 16.0) {
-            citizen.getNavigation().moveTo(inbox.getX() + 0.5, inbox.getY(), inbox.getZ() + 0.5, 0.9);
+
+        BlockPos targetChestPos = hasValidInbox ? inbox : allChests.get(0);
+        if (citizen.distanceToSqr(targetChestPos.getX() + 0.5, targetChestPos.getY(), targetChestPos.getZ() + 0.5) > 16.0) {
+            if (citizen.getNavigation().isDone() || citizen.getNavigation().getTargetPos() == null
+                || citizen.getNavigation().getTargetPos().distSqr(targetChestPos) > 4.0) {
+                citizen.getNavigation().moveTo(targetChestPos.getX() + 0.5, targetChestPos.getY(), targetChestPos.getZ() + 0.5, 0.95);
+            }
             return true;
         }
 
-        int logPacks = 0;
+        // Build ordered list of chests: inbox first, then all other warehouse chests as fallback if inbox is full!
+        List<ChestBlockEntity> targetChests = new ArrayList<>();
+        if (hasValidInbox && level.getBlockEntity(inbox) instanceof ChestBlockEntity inboxChest) {
+            targetChests.add(inboxChest);
+        }
+        for (BlockPos pos : allChests) {
+            if (pos.equals(inbox)) continue;
+            if (level.getBlockEntity(pos) instanceof ChestBlockEntity c) targetChests.add(c);
+        }
+
+        int totalLogsDelivered = 0;
         int sticks = 0;
         int apples = 0;
         int saplings = 0;
+        int saplingsKept = 0;
         for (int slot = 0; slot < citizen.getNpcInventory().getContainerSize(); slot++) {
             ItemStack inventoryStack = citizen.getNpcInventory().getItem(slot);
+            if (inventoryStack.isEmpty()) continue;
             int amount;
-            if (inventoryStack.is(ItemTags.LOGS)) {
-                amount = inventoryStack.getCount() >= 64 ? 64 : 0;
-            } else if (isLumberjackSecondaryResource(inventoryStack)) {
+            if (inventoryStack.is(ItemTags.LOGS) || inventoryStack.is(Items.STICK) || inventoryStack.is(Items.APPLE)) {
                 amount = inventoryStack.getCount();
+            } else if (isSapling(inventoryStack)) {
+                int canKeep = Math.max(0, 8 - saplingsKept);
+                int keepNow = Math.min(canKeep, inventoryStack.getCount());
+                saplingsKept += keepNow;
+                amount = inventoryStack.getCount() - keepNow;
             } else continue;
             if (amount <= 0) continue;
 
-            ItemStack cargo = new ItemStack(inventoryStack.getItem(), amount);
-            ItemStack remainder = insert(chest, cargo);
-            int delivered = amount - remainder.getCount();
-            if (delivered <= 0) continue;
-            inventoryStack.shrink(delivered);
-            if (inventoryStack.isEmpty()) citizen.getNpcInventory().setItem(slot, ItemStack.EMPTY);
-            if (inventoryStack.is(ItemTags.LOGS)) logPacks += delivered / 64;
-            else if (inventoryStack.is(Items.STICK)) sticks += delivered;
-            else if (inventoryStack.is(Items.APPLE)) apples += delivered;
-            else if (isSapling(cargo)) saplings += delivered;
+            int remainingToInsert = amount;
+            for (ChestBlockEntity targetChest : targetChests) {
+                if (remainingToInsert <= 0) break;
+                ItemStack cargo = new ItemStack(inventoryStack.getItem(), remainingToInsert);
+                ItemStack remainder = insert(targetChest, cargo);
+                int delivered = remainingToInsert - remainder.getCount();
+                if (delivered > 0) {
+                    inventoryStack.shrink(delivered);
+                    if (inventoryStack.isEmpty()) citizen.getNpcInventory().setItem(slot, ItemStack.EMPTY);
+                    targetChest.setChanged();
+                    remainingToInsert -= delivered;
+                    if (cargo.is(ItemTags.LOGS)) totalLogsDelivered += delivered;
+                    else if (cargo.is(Items.STICK)) sticks += delivered;
+                    else if (cargo.is(Items.APPLE)) apples += delivered;
+                    else if (isSapling(cargo)) saplings += delivered;
+                }
+            }
         }
+
+        // Fallback: if all chests were full and cargo remains, hand the rest to the Storager inside the Warehouse!
+        if (hasAnyDeliverableLumberjackCargo(citizen)) {
+            UUID storagerId = data.storager(citizen.getNationId());
+            if (storagerId != null && level.getEntity(storagerId) instanceof CitizenEntity storager
+                && storager != citizen && isCitizenInsideWarehouse(storager, warehouse)) {
+                int movedToStorager = transferLumberjackCargoToContainer(citizen, storager.getNpcInventory());
+                if (movedToStorager > 0) {
+                    storager.getNpcInventory().setChanged();
+                    totalLogsDelivered += movedToStorager;
+                }
+            }
+        }
+
         citizen.getNpcInventory().setChanged();
-        chest.setChanged();
         List<String> deliveredCargo = new ArrayList<>();
-        if (logPacks > 0) deliveredCargo.add(logPacks + (logPacks == 1 ? " pack de madeira" : " packs de madeira"));
+        if (totalLogsDelivered > 0) deliveredCargo.add(totalLogsDelivered + "x troncos de madeira");
         if (sticks > 0) deliveredCargo.add(sticks + "x gravetos");
         if (apples > 0) deliveredCargo.add(apples + (apples == 1 ? "x maçã" : "x maçãs"));
         if (saplings > 0) deliveredCargo.add(saplings + (saplings == 1 ? "x muda" : "x mudas"));
         if (!deliveredCargo.isEmpty()) {
-            citizen.announce("Entreguei " + String.join(", ", deliveredCargo) + " ao Storager.");
+            citizen.announce("Entreguei " + String.join(", ", deliveredCargo) + " na Warehouse.");
         }
-        return hasLumberjackDeliveryResources(citizen);
+        // Return false once we reached the chest and deposited all we could, so the Lumberjack never freezes if chests are full!
+        return false;
+    }
+
+    private static int transferLumberjackCargoToContainer(CitizenEntity citizen, Container targetContainer) {
+        int totalTransferred = 0;
+        int saplingsKept = 0;
+        for (int slot = 0; slot < citizen.getNpcInventory().getContainerSize(); slot++) {
+            ItemStack stack = citizen.getNpcInventory().getItem(slot);
+            if (stack.isEmpty()) continue;
+            int amount;
+            if (stack.is(ItemTags.LOGS) || stack.is(Items.STICK) || stack.is(Items.APPLE)) {
+                amount = stack.getCount();
+            } else if (isSapling(stack)) {
+                int canKeep = Math.max(0, 8 - saplingsKept);
+                int keepNow = Math.min(canKeep, stack.getCount());
+                saplingsKept += keepNow;
+                amount = stack.getCount() - keepNow;
+            } else continue;
+            if (amount <= 0) continue;
+            ItemStack toMove = new ItemStack(stack.getItem(), amount);
+            ItemStack rem = insert(targetContainer, toMove);
+            int moved = amount - rem.getCount();
+            if (moved > 0) {
+                stack.shrink(moved);
+                if (stack.isEmpty()) citizen.getNpcInventory().setItem(slot, ItemStack.EMPTY);
+                totalTransferred += moved;
+            }
+        }
+        return totalTransferred;
     }
 
     public static boolean retrieveFirstSapling(CitizenEntity citizen, ServerLevel level) {
@@ -462,25 +647,154 @@ public final class StorageJob implements ProfessionJob {
         return retrieveBestTool(citizen, level, SHOVEL_RECIPES);
     }
 
-    /** Walks to the nation's Storager and transfers an already fulfilled material request. */
+    /** Walks to the Warehouse chests or the nation's Storager and transfers requested materials. */
     public static boolean retrieveRequestedItem(CitizenEntity citizen, ServerLevel level, Item item, int amount) {
-        UUID storagerId = CivilizationData.get(level).storager(citizen.getNationId());
-        if (storagerId == null) return false;
-        Entity entity = level.getEntity(storagerId);
-        if (!(entity instanceof CitizenEntity storager) || storager == citizen
-            || !citizen.getNationId().equals(storager.getNationId())) return false;
-        if (citizen.distanceToSqr(storager) > 16.0) {
-            if (citizen.getNavigation().isDone()) citizen.getNavigation().moveTo(storager, 0.9);
-            return true;
+        CivilizationData data = CivilizationData.get(level);
+        UUID nationId = citizen.getNationId();
+        String requestId = resourceRequestId(item);
+        boolean isPlanks = new ItemStack(item).is(ItemTags.PLANKS);
+        boolean isStairs = new ItemStack(item).is(ItemTags.STAIRS);
+        TagKey<Item> matchTag = isPlanks ? ItemTags.PLANKS : (isStairs ? ItemTags.STAIRS : null);
+
+        // 1. Check Warehouse chests first (and convert logs inside chests if planks are requested)
+        CivilizationData.Warehouse warehouse = data.warehouse(nationId);
+        if (warehouse != null && warehouse.dimension().equals(level.dimension().location())) {
+            List<BlockPos> chests = findChests(level, warehouse);
+            for (BlockPos chestPos : chests) {
+                if (!(level.getBlockEntity(chestPos) instanceof ChestBlockEntity chest)) continue;
+                Item targetItem = findMatchingItemInContainer(chest, item, matchTag);
+                Item logToConvert = (targetItem == null && isPlanks) ? firstLogItem(chest) : null;
+                if (targetItem == null && logToConvert == null) continue;
+
+                if (citizen.distanceToSqr(chestPos.getX() + 0.5, chestPos.getY() + 0.5, chestPos.getZ() + 0.5) > 16.0) {
+                    if (citizen.getNavigation().isDone() || citizen.getNavigation().getTargetPos() == null
+                        || citizen.getNavigation().getTargetPos().distSqr(chestPos) > 4.0) {
+                        citizen.getNavigation().moveTo(chestPos.getX() + 0.5, chestPos.getY(), chestPos.getZ() + 0.5, 0.95);
+                    }
+                    return true;
+                }
+
+                if (targetItem == null && logToConvert != null) {
+                    Item planksFromLog = planksForLog(logToConvert);
+                    if (planksFromLog != Items.AIR) {
+                        int logsNeeded = Math.max(1, (amount + 3) / 4);
+                        int logsAvailable = Math.min(logsNeeded, countItem(chest, logToConvert));
+                        while (logsAvailable > 0 && citizen.getNpcInventory().canAddItem(new ItemStack(planksFromLog, 4))) {
+                            if (removeItem(chest, logToConvert, 1) == 0) {
+                                citizen.getNpcInventory().addItem(new ItemStack(planksFromLog, 4));
+                                logsAvailable--;
+                            } else {
+                                break;
+                            }
+                        }
+                        chest.setChanged();
+                        citizen.getNpcInventory().setChanged();
+                        fulfillMatchingRequestsForCitizen(data, citizen, requestId);
+                        citizen.announce("Peguei troncos no baú da Warehouse e converti em tábuas para a obra.");
+                        return true;
+                    }
+                }
+
+                if (targetItem != null) {
+                    int available = Math.min(amount, countItem(chest, targetItem));
+                    if (available > 0 && citizen.getNpcInventory().canAddItem(new ItemStack(targetItem, available))) {
+                        int notRemoved = removeItem(chest, targetItem, available);
+                        int taken = available - notRemoved;
+                        if (taken > 0) {
+                            citizen.getNpcInventory().addItem(new ItemStack(targetItem, taken));
+                            chest.setChanged();
+                            citizen.getNpcInventory().setChanged();
+                            fulfillMatchingRequestsForCitizen(data, citizen, requestId);
+                            citizen.announce("Retirei " + taken + " " + BuiltInRegistries.ITEM.getKey(targetItem).getPath() + " do baú da Warehouse.");
+                            return true;
+                        }
+                    }
+                }
+            }
         }
-        int available = Math.min(amount, countItem(storager.getNpcInventory(), item));
-        if (available <= 0 || !citizen.getNpcInventory().canAddItem(new ItemStack(item, available))) return false;
-        if (removeItem(storager.getNpcInventory(), item, available) != 0) return false;
-        citizen.getNpcInventory().addItem(new ItemStack(item, available));
-        storager.getNpcInventory().setChanged();
-        citizen.getNpcInventory().setChanged();
-        citizen.announce("Recebi " + available + " " + BuiltInRegistries.ITEM.getKey(item) + " do Storager.");
-        return true;
+
+        // 2. Check the Storager's inventory (citizen walks into the Warehouse to pick up from Storager)
+        UUID storagerId = data.storager(nationId);
+        if (storagerId != null && level.getEntity(storagerId) instanceof CitizenEntity storager
+            && storager != citizen && nationId.equals(storager.getNationId())) {
+            Item targetInStorager = findMatchingItemInContainer(storager.getNpcInventory(), item, matchTag);
+            Item logInStorager = (targetInStorager == null && isPlanks) ? firstLogItem(storager.getNpcInventory()) : null;
+            if (targetInStorager != null || logInStorager != null) {
+                if (!isCitizenInsideWarehouse(citizen, warehouse) || citizen.distanceToSqr(storager) > 16.0) {
+                    if (citizen.getNavigation().isDone()) citizen.getNavigation().moveTo(storager, 0.95);
+                    return true;
+                }
+                if (targetInStorager == null && logInStorager != null) {
+                    Item planksFromLog = planksForLog(logInStorager);
+                    if (planksFromLog != Items.AIR && citizen.getNpcInventory().canAddItem(new ItemStack(planksFromLog, 4))) {
+                        int logsNeeded = Math.max(1, (amount + 3) / 4);
+                        int logsAvailable = Math.min(logsNeeded, countItem(storager.getNpcInventory(), logInStorager));
+                        while (logsAvailable > 0 && citizen.getNpcInventory().canAddItem(new ItemStack(planksFromLog, 4))) {
+                            if (removeItem(storager.getNpcInventory(), logInStorager, 1) == 0) {
+                                citizen.getNpcInventory().addItem(new ItemStack(planksFromLog, 4));
+                                logsAvailable--;
+                            } else {
+                                break;
+                            }
+                        }
+                        storager.getNpcInventory().setChanged();
+                        citizen.getNpcInventory().setChanged();
+                        fulfillMatchingRequestsForCitizen(data, citizen, requestId);
+                        citizen.announce("Vim até a Warehouse, recebi troncos do Storager e converti em tábuas.");
+                        return true;
+                    }
+                }
+                if (targetInStorager != null) {
+                    int available = Math.min(amount, countItem(storager.getNpcInventory(), targetInStorager));
+                    if (available > 0 && citizen.getNpcInventory().canAddItem(new ItemStack(targetInStorager, available))
+                        && removeItem(storager.getNpcInventory(), targetInStorager, available) == 0) {
+                        citizen.getNpcInventory().addItem(new ItemStack(targetInStorager, available));
+                        storager.getNpcInventory().setChanged();
+                        citizen.getNpcInventory().setChanged();
+                        fulfillMatchingRequestsForCitizen(data, citizen, requestId);
+                        citizen.announce("Vim até a Warehouse e recebi " + available + " "
+                            + BuiltInRegistries.ITEM.getKey(targetInStorager).getPath() + " do Storager.");
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // 3. If the citizen has an open request for this resource (excluding dirt, which Builder can dig if out of stock), walk into the Warehouse to wait for it!
+        if (item != Items.DIRT) {
+            for (CivilizationData.StorageRequest req : data.openStorageRequests(nationId)) {
+                if (req.requesterId().equals(citizen.getUUID()) && req.itemId().equals(requestId)) {
+                    if (warehouse != null && warehouse.dimension().equals(level.dimension().location())
+                        && !isCitizenInsideWarehouse(citizen, warehouse)) {
+                        if (citizen.getNavigation().isDone()) {
+                            citizen.getNavigation().moveTo(warehouse.x() + 0.5, warehouse.y(), warehouse.z() + 0.5, 0.95);
+                        }
+                        return true;
+                    }
+                    break;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static Item findMatchingItemInContainer(Container container, Item item, TagKey<Item> matchTag) {
+        if (countItem(container, item) > 0) return item;
+        if (matchTag != null) {
+            for (int i = 0; i < container.getContainerSize(); i++) {
+                ItemStack s = container.getItem(i);
+                if (!s.isEmpty() && s.is(matchTag)) return s.getItem();
+            }
+        }
+        return null;
+    }
+
+    private static void fulfillMatchingRequestsForCitizen(CivilizationData data, CitizenEntity citizen, String requestId) {
+        for (CivilizationData.StorageRequest req : data.openStorageRequests(citizen.getNationId())) {
+            if (req.requesterId().equals(citizen.getUUID()) && req.itemId().equals(requestId)) {
+                data.fulfillStorageRequest(req.id());
+            }
+        }
     }
 
     private static int pickaxeTier(Item pickaxe) {
@@ -494,8 +808,99 @@ public final class StorageJob implements ProfessionJob {
 
     private static boolean retrieveBestTool(CitizenEntity citizen, ServerLevel level, List<ToolRecipe> recipes) {
         CivilizationData data = CivilizationData.get(level);
-        // Requests are delivered by the Storager; citizens must not take stock directly.
-        return hasPendingToolRequest(data, citizen, recipes);
+        UUID nationId = citizen.getNationId();
+        CivilizationData.Warehouse warehouse = data.warehouse(nationId);
+
+        // 1. Check Warehouse chests for the best available tool
+        if (warehouse != null && warehouse.dimension().equals(level.dimension().location())) {
+            List<BlockPos> chests = findChests(level, warehouse);
+            for (ToolRecipe recipe : recipes) {
+                for (BlockPos chestPos : chests) {
+                    if (!(level.getBlockEntity(chestPos) instanceof ChestBlockEntity chest)) continue;
+                    int slot = findItem(chest, recipe.tool());
+                    if (slot < 0) continue;
+                    if (citizen.distanceToSqr(chestPos.getX() + 0.5, chestPos.getY() + 0.5, chestPos.getZ() + 0.5) > 16.0) {
+                        if (citizen.getNavigation().isDone() || citizen.getNavigation().getTargetPos() == null
+                            || citizen.getNavigation().getTargetPos().distSqr(chestPos) > 4.0) {
+                            citizen.getNavigation().moveTo(chestPos.getX() + 0.5, chestPos.getY(), chestPos.getZ() + 0.5, 0.95);
+                        }
+                        return true;
+                    }
+                    ItemStack tool = chest.getItem(slot).split(1);
+                    if (chest.getItem(slot).isEmpty()) chest.setItem(slot, ItemStack.EMPTY);
+                    chest.setChanged();
+                    if (citizen.getMainHandItem().isEmpty()) {
+                        citizen.setItemSlot(EquipmentSlot.MAINHAND, tool);
+                    } else {
+                        ItemStack rem = citizen.getNpcInventory().addItem(tool);
+                        if (!rem.isEmpty()) insert(chest, rem);
+                    }
+                    citizen.getNpcInventory().setChanged();
+                    fulfillMatchingToolRequests(data, citizen, recipes);
+                    citizen.announce("Peguei " + BuiltInRegistries.ITEM.getKey(recipe.tool()).getPath() + " no baú da Warehouse.");
+                    return true;
+                }
+            }
+        }
+
+        // 2. Check Storager's inventory (only inside Warehouse)
+        UUID storagerId = data.storager(nationId);
+        if (storagerId != null && level.getEntity(storagerId) instanceof CitizenEntity storager
+            && storager != citizen && nationId.equals(storager.getNationId())) {
+            for (ToolRecipe recipe : recipes) {
+                int slot = findItem(storager.getNpcInventory(), recipe.tool());
+                if (slot < 0) continue;
+                if (!isCitizenInsideWarehouse(citizen, warehouse) || citizen.distanceToSqr(storager) > 16.0) {
+                    if (citizen.getNavigation().isDone()) citizen.getNavigation().moveTo(storager, 0.95);
+                    return true;
+                }
+                ItemStack tool = storager.getNpcInventory().getItem(slot).split(1);
+                if (storager.getNpcInventory().getItem(slot).isEmpty()) {
+                    storager.getNpcInventory().setItem(slot, ItemStack.EMPTY);
+                }
+                storager.getNpcInventory().setChanged();
+                if (citizen.getMainHandItem().isEmpty()) {
+                    citizen.setItemSlot(EquipmentSlot.MAINHAND, tool);
+                } else {
+                    ItemStack rem = citizen.getNpcInventory().addItem(tool);
+                    if (!rem.isEmpty()) storager.getNpcInventory().addItem(rem);
+                }
+                citizen.getNpcInventory().setChanged();
+                fulfillMatchingToolRequests(data, citizen, recipes);
+                citizen.announce("Vim até a Warehouse e peguei " + BuiltInRegistries.ITEM.getKey(recipe.tool()).getPath() + " com o Storager.");
+                return true;
+            }
+        }
+
+        // 3. If a tool request is already pending in the queue, walk to the Warehouse to wait for the Storager to craft/hand it over!
+        if (hasPendingToolRequest(data, citizen, recipes)) {
+            if (warehouse != null && warehouse.dimension().equals(level.dimension().location())
+                && !isCitizenInsideWarehouse(citizen, warehouse)) {
+                if (citizen.getNavigation().isDone()) {
+                    citizen.getNavigation().moveTo(warehouse.x() + 0.5, warehouse.y(), warehouse.z() + 0.5, 0.95);
+                }
+            }
+            return true;
+        }
+        return false;
+    }
+
+    private static void fulfillMatchingToolRequests(CivilizationData data, CitizenEntity citizen, List<ToolRecipe> recipes) {
+        for (CivilizationData.StorageRequest request : data.openStorageRequests(citizen.getNationId())) {
+            if (!request.requesterId().equals(citizen.getUUID())) continue;
+            if (request.itemId().equals(BEST_AXE_REQUEST_ID)
+                && recipes.stream().anyMatch(recipe -> recipe.tool() == Items.WOODEN_AXE)) {
+                data.fulfillStorageRequest(request.id());
+            } else if (request.itemId().equals(BEST_SHOVEL_REQUEST_ID)
+                && recipes.stream().anyMatch(recipe -> recipe.tool() == Items.WOODEN_SHOVEL)) {
+                data.fulfillStorageRequest(request.id());
+            } else if (request.itemId().equals(BEST_PICKAXE_REQUEST_ID)
+                || request.itemId().startsWith(BEST_PICKAXE_REQUEST_ID + ".tier_")) {
+                if (recipes.stream().anyMatch(recipe -> pickaxeTier(recipe.tool()) >= 0)) {
+                    data.fulfillStorageRequest(request.id());
+                }
+            }
+        }
     }
 
     private boolean processRequests(CitizenEntity citizen, ServerLevel level, CivilizationData data,
@@ -506,8 +911,11 @@ public final class StorageJob implements ProfessionJob {
         requests.sort(Comparator.comparingInt(request -> isToolRequest(request.itemId()) ? 0 : 1));
         for (CivilizationData.StorageRequest request : requests) {
             if (request.itemId().startsWith(RESOURCE_REQUEST_PREFIX)) {
-                processResourceRequest(citizen, data, request, request.itemId().substring(RESOURCE_REQUEST_PREFIX.length()),
-                    request.count(), chestPositions, level);
+                if (processResourceRequest(citizen, data, warehouse, request,
+                    request.itemId().substring(RESOURCE_REQUEST_PREFIX.length()),
+                    request.count(), chestPositions, level)) {
+                    return true;
+                }
                 continue;
             }
             List<ToolRecipe> recipes;
@@ -570,9 +978,15 @@ public final class StorageJob implements ProfessionJob {
     private boolean deliverRequestedTool(CitizenEntity storager, ServerLevel level, CivilizationData data,
                                          CivilizationData.StorageRequest request, ToolRecipe recipe,
                                          List<BlockPos> chestPositions) {
+        CivilizationData.Warehouse warehouse = data.warehouse(storager.getNationId());
         Entity targetEntity = level.getEntity(request.requesterId());
         if (!(targetEntity instanceof CitizenEntity requester) || requester == storager
             || !requester.getNationId().equals(storager.getNationId())) return false;
+
+        // Storager NEVER leaves the Warehouse! He only delivers if the requester is inside the Warehouse.
+        if (!isCitizenInsideWarehouse(requester, warehouse)) {
+            return false;
+        }
 
         if (storager.distanceToSqr(requester) > 16.0) {
             if (findItem(storager.getNpcInventory(), recipe.tool()) < 0) {
@@ -607,7 +1021,7 @@ public final class StorageJob implements ProfessionJob {
         requester.getNpcInventory().setChanged();
         data.fulfillStorageRequest(request.id());
         storager.announce("Entreguei " + BuiltInRegistries.ITEM.getKey(recipe.tool()).getPath()
-            + " para " + requester.getPersonalName() + ".");
+            + " para " + requester.getPersonalName() + " aqui na Warehouse.");
         requester.announce("Recebi a ferramenta que pedi ao Storager.");
         return true;
     }
@@ -692,29 +1106,87 @@ public final class StorageJob implements ProfessionJob {
         return countTaggedItems(citizen.getNpcInventory(), chests, level, ItemTags.PLANKS) >= requiredPlanks;
     }
 
-    private void processResourceRequest(CitizenEntity storager, CivilizationData data,
-                                        CivilizationData.StorageRequest request, String itemId, int count,
-                                        List<BlockPos> chests, ServerLevel level) {
+    private boolean processResourceRequest(CitizenEntity storager, CivilizationData data,
+                                           CivilizationData.Warehouse warehouse,
+                                           CivilizationData.StorageRequest request, String itemId, int count,
+                                           List<BlockPos> chests, ServerLevel level) {
         ResourceLocation key = ResourceLocation.tryParse(itemId);
-        if (key == null) return;
+        if (key == null) return false;
         Item item = BuiltInRegistries.ITEM.getValue(key);
-        if (item == Items.AIR || count <= 0) return;
+        if (item == Items.AIR || count <= 0) return false;
+        boolean isPlankRequest = new ItemStack(item).is(ItemTags.PLANKS);
+        boolean isStairRequest = new ItemStack(item).is(ItemTags.STAIRS);
         if (countItem(storager.getNpcInventory(), chests, level, item) < count) {
-            if (new ItemStack(item).is(ItemTags.PLANKS)) {
-                for (int attempt = 0; attempt < 8 && countItem(storager.getNpcInventory(), chests, level, item) < count; attempt++) {
-                    if (!convertLogsToRequestedPlanks(storager, chests, level, item)) break;
+            if (isPlankRequest) {
+                for (int attempt = 0; attempt < 16 && countTaggedItems(storager.getNpcInventory(), chests, level, ItemTags.PLANKS) < count; attempt++) {
+                    if (convertLogsToRequestedPlanks(storager, chests, level, item)
+                        || convertLogsToPlanks(storager, chests, level)) continue;
+                    int logsNeeded = Math.max(2, (count - countTaggedItems(storager.getNpcInventory(), chests, level, ItemTags.PLANKS) + 3) / 4);
+                    if (takeLogsFromNearbyCitizen(storager, level, warehouse, Math.min(8, logsNeeded))) continue;
+                    break;
                 }
-            } else if (new ItemStack(item).is(ItemTags.STAIRS)) {
+            } else if (isStairRequest) {
+                if (countTaggedItems(storager.getNpcInventory(), chests, level, ItemTags.PLANKS) < 6
+                    && countTaggedItems(storager.getNpcInventory(), chests, level, ItemTags.LOGS) < 2) {
+                    takeLogsFromNearbyCitizen(storager, level, warehouse, 2);
+                }
                 craftRequestedStairs(storager, chests, level, item, count);
             }
         }
-        if (countItem(storager.getNpcInventory(), chests, level, item) < count
-            || !storager.getNpcInventory().canAddItem(new ItemStack(item, count))) return;
-        if (!consumeItem(storager.getNpcInventory(), chests, level, item, count)) return;
-        storager.getNpcInventory().addItem(new ItemStack(item, count));
-        storager.getNpcInventory().setChanged();
-        data.fulfillStorageRequest(request.id());
-        storager.announce("Separei " + count + " " + BuiltInRegistries.ITEM.getKey(item) + " para o Builder.");
+        Item itemToProvide = item;
+        int availableCount = countItem(storager.getNpcInventory(), chests, level, itemToProvide);
+        if (availableCount <= 0 && isPlankRequest) {
+            // Use ANY available plank species in inventory or chests
+            Item anyPlank = findAnyAvailableItemByTag(storager.getNpcInventory(), chests, level, ItemTags.PLANKS);
+            if (anyPlank != null) {
+                itemToProvide = anyPlank;
+                availableCount = countItem(storager.getNpcInventory(), chests, level, itemToProvide);
+            }
+        } else if (availableCount <= 0 && isStairRequest) {
+            Item anyStair = findAnyAvailableItemByTag(storager.getNpcInventory(), chests, level, ItemTags.STAIRS);
+            if (anyStair != null) {
+                itemToProvide = anyStair;
+                availableCount = countItem(storager.getNpcInventory(), chests, level, itemToProvide);
+            }
+        }
+        int transferAmount = Math.min(count, availableCount);
+        if (transferAmount <= 0) return false;
+
+        // Ensure the Storager is holding the items in his inventory for delivery or pickup
+        int inStoragerInv = countItem(storager.getNpcInventory(), itemToProvide);
+        if (inStoragerInv < transferAmount) {
+            int toPullFromChests = transferAmount - inStoragerInv;
+            if (storager.getNpcInventory().canAddItem(new ItemStack(itemToProvide, toPullFromChests))
+                && consumeItem(storager.getNpcInventory(), chests, level, itemToProvide, transferAmount)) {
+                storager.getNpcInventory().addItem(new ItemStack(itemToProvide, transferAmount));
+                storager.getNpcInventory().setChanged();
+            }
+        }
+
+        // Only deliver directly if the requester is ALREADY inside the Warehouse; otherwise leave in Warehouse chest/inventory for pickup!
+        Entity targetEntity = level.getEntity(request.requesterId());
+        if (targetEntity instanceof CitizenEntity requester && requester != storager
+            && requester.getNationId().equals(storager.getNationId())
+            && isCitizenInsideWarehouse(requester, warehouse)) {
+            int held = Math.min(count, countItem(storager.getNpcInventory(), itemToProvide));
+            if (held > 0) {
+                if (storager.distanceToSqr(requester) > 16.0) {
+                    if (storager.getNavigation().isDone()) storager.getNavigation().moveTo(requester, 0.95);
+                    return true;
+                }
+                if (requester.getNpcInventory().canAddItem(new ItemStack(itemToProvide, held))
+                    && removeItem(storager.getNpcInventory(), itemToProvide, held) == 0) {
+                    requester.getNpcInventory().addItem(new ItemStack(itemToProvide, held));
+                    storager.getNpcInventory().setChanged();
+                    requester.getNpcInventory().setChanged();
+                    data.fulfillStorageRequest(request.id());
+                    storager.announce("Entreguei " + held + " " + BuiltInRegistries.ITEM.getKey(itemToProvide).getPath()
+                        + " para " + requester.getPersonalName() + " aqui na Warehouse.");
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     private boolean convertLogsToRequestedPlanks(CitizenEntity citizen, List<BlockPos> chests, ServerLevel level, Item planks) {
@@ -746,22 +1218,62 @@ public final class StorageJob implements ProfessionJob {
     }
 
     private void craftRequestedStairs(CitizenEntity citizen, List<BlockPos> chests, ServerLevel level, Item stairs, int targetCount) {
-        ResourceLocation stairId = BuiltInRegistries.ITEM.getKey(stairs);
-        String path = stairId.getPath();
-        if (!path.endsWith("_stairs")) return;
-        Item planks = BuiltInRegistries.ITEM.getValue(ResourceLocation.fromNamespaceAndPath(
-            stairId.getNamespace(), path.substring(0, path.length() - "_stairs".length()) + "_planks"));
-        if (planks == Items.AIR) return;
         int crafts = 0;
-        while (countItem(citizen.getNpcInventory(), chests, level, stairs) < targetCount && crafts++ < 8) {
-            if (countItem(citizen.getNpcInventory(), chests, level, planks) < 6
-                && !convertLogsToRequestedPlanks(citizen, chests, level, planks)) return;
-            if (countItem(citizen.getNpcInventory(), chests, level, planks) < 6
-                || !citizen.getNpcInventory().canAddItem(new ItemStack(stairs, 4))) return;
+        while (countTaggedItems(citizen.getNpcInventory(), chests, level, ItemTags.STAIRS) < targetCount && crafts++ < 8) {
+            Item planks = findPlanksWithAtLeast(citizen.getNpcInventory(), chests, level, 6);
+            if (planks == null && convertLogsToPlanks(citizen, chests, level)) {
+                planks = findPlanksWithAtLeast(citizen.getNpcInventory(), chests, level, 6);
+            }
+            if (planks == null && convertLogsToPlanks(citizen, chests, level)) {
+                planks = findPlanksWithAtLeast(citizen.getNpcInventory(), chests, level, 6);
+            }
+            if (planks == null) return;
+            Item targetStair = stairsForPlanks(planks);
+            if (targetStair == Items.AIR) targetStair = stairs;
+            if (!citizen.getNpcInventory().canAddItem(new ItemStack(targetStair, 4))) return;
             if (!consumeItem(citizen.getNpcInventory(), chests, level, planks, 6)) return;
-            citizen.getNpcInventory().addItem(new ItemStack(stairs, 4));
+            citizen.getNpcInventory().addItem(new ItemStack(targetStair, 4));
             citizen.getNpcInventory().setChanged();
         }
+    }
+
+    private static Item findAnyAvailableItemByTag(Container inventory, List<BlockPos> chests, ServerLevel level, TagKey<Item> tag) {
+        for (int i = 0; i < inventory.getContainerSize(); i++) {
+            ItemStack s = inventory.getItem(i);
+            if (s.is(tag)) return s.getItem();
+        }
+        for (BlockPos pos : chests) {
+            if (!(level.getBlockEntity(pos) instanceof ChestBlockEntity chest)) continue;
+            for (int i = 0; i < chest.getContainerSize(); i++) {
+                ItemStack s = chest.getItem(i);
+                if (s.is(tag)) return s.getItem();
+            }
+        }
+        return null;
+    }
+
+    private static Item findPlanksWithAtLeast(Container inventory, List<BlockPos> chests, ServerLevel level, int minCount) {
+        for (int i = 0; i < inventory.getContainerSize(); i++) {
+            ItemStack s = inventory.getItem(i);
+            if (s.is(ItemTags.PLANKS) && countItem(inventory, chests, level, s.getItem()) >= minCount) return s.getItem();
+        }
+        for (BlockPos pos : chests) {
+            if (!(level.getBlockEntity(pos) instanceof ChestBlockEntity chest)) continue;
+            for (int i = 0; i < chest.getContainerSize(); i++) {
+                ItemStack s = chest.getItem(i);
+                if (s.is(ItemTags.PLANKS) && countItem(inventory, chests, level, s.getItem()) >= minCount) return s.getItem();
+            }
+        }
+        return null;
+    }
+
+    private static Item stairsForPlanks(Item planks) {
+        ResourceLocation key = BuiltInRegistries.ITEM.getKey(planks);
+        String path = key.getPath();
+        if (!path.endsWith("_planks")) return Items.OAK_STAIRS;
+        Item stair = BuiltInRegistries.ITEM.getValue(ResourceLocation.fromNamespaceAndPath(
+            key.getNamespace(), path.substring(0, path.length() - "_planks".length()) + "_stairs"));
+        return stair == Items.AIR ? Items.OAK_STAIRS : stair;
     }
 
     private int parseRequestedPickaxeTier(String requestId) {
@@ -839,68 +1351,40 @@ public final class StorageJob implements ProfessionJob {
 
     private void decorateWarehouse(CitizenEntity citizen, ServerLevel level,
                                   CivilizationData.Warehouse warehouse, List<BlockPos> chests) {
-        int radius = Math.max(1, Math.min(6, warehouse.radius() / 2));
-        int width = radius * 2 + 1;
-        int floorCells = width * width;
-        for (int placed = 0; placed < 4; placed++) {
-            if (!decoratingFence) {
-                if (decorationIndex >= floorCells) {
-                    decoratingFence = true;
-                    decorationIndex = 0;
-                    continue;
-                }
-                int xOffset = decorationIndex % width - radius;
-                int zOffset = decorationIndex / width - radius;
-                BlockPos center = warehouse.center();
-                int x = center.getX() + xOffset;
-                int z = center.getZ() + zOffset;
-                if (!level.hasChunkAt(new BlockPos(x, center.getY(), z))) {
-                    decorationIndex++;
-                    continue;
-                }
-                int y = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
-                BlockPos floor = new BlockPos(x, y, z);
-                if (level.getBlockState(floor).is(BlockTags.PLANKS) || !isNaturalGround(level.getBlockState(floor))
-                    || level.getBlockState(floor).hasBlockEntity()) {
-                    decorationIndex++;
-                    continue;
-                }
-                Item plank = removeOnePlank(citizen.getNpcInventory(), chests, level);
-                if (plank == null && convertLogsToPlanks(citizen, chests, level)) {
-                    plank = removeOnePlank(citizen.getNpcInventory(), chests, level);
-                }
-                if (plank == null) return;
-                Block plankBlock = Block.byItem(plank);
-                if (plankBlock == Blocks.AIR || !level.setBlockAndUpdate(floor, plankBlock.defaultBlockState())) {
-                    insert(citizen.getNpcInventory(), new ItemStack(plank));
-                }
-                decorationIndex++;
-            } else {
-                int perimeterLength = radius * 8;
-                if (decorationIndex >= perimeterLength) {
-                    decorationIndex = perimeterLength;
-                    return;
-                }
-                BlockPos fencePos = perimeterPosition(warehouse.center(), radius, decorationIndex);
-                if (!level.hasChunkAt(fencePos)) {
-                    decorationIndex++;
-                    continue;
-                }
-                int y = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, fencePos.getX(), fencePos.getZ());
-                fencePos = new BlockPos(fencePos.getX(), y, fencePos.getZ());
-                if (!level.getBlockState(fencePos).isAir()
-                    || !level.getBlockState(fencePos.below()).isFaceSturdy(level, fencePos.below(), Direction.UP)) {
-                    decorationIndex++;
-                    continue;
-                }
-                Item fence = removeOneFence(citizen, chests, level);
-                if (fence == null) return;
-                Block fenceBlock = Block.byItem(fence);
-                if (fenceBlock == Blocks.AIR || !level.setBlockAndUpdate(fencePos, fenceBlock.defaultBlockState())) {
-                    insert(citizen.getNpcInventory(), new ItemStack(fence));
-                }
-                decorationIndex++;
+        BlockPos center = warehouse.center();
+        int targetFloorY = warehouse.y() - 1;
+        int placed = 0;
+        // Phase 1: Ensure all 10x10 floor blocks (x in -5..4, z in -5..4) are wood planks
+        while (!decoratingFence && placed < 4) {
+            if (decorationIndex >= 100) {
+                decoratingFence = true;
+                decorationIndex = 0;
+                break;
             }
+            int x = center.getX() - 5 + (decorationIndex % 10);
+            int z = center.getZ() - 5 + (decorationIndex / 10);
+            BlockPos floor = new BlockPos(x, targetFloorY, z);
+            if (!level.hasChunkAt(floor)) {
+                decorationIndex++;
+                continue;
+            }
+            BlockState floorState = level.getBlockState(floor);
+            if (floorState.is(BlockTags.PLANKS) || floorState.hasBlockEntity()) {
+                decorationIndex++;
+                continue;
+            }
+            Item plank = removeOnePlank(citizen.getNpcInventory(), chests, level);
+            if (plank == null && convertLogsToPlanks(citizen, chests, level)) {
+                plank = removeOnePlank(citizen.getNpcInventory(), chests, level);
+            }
+            if (plank == null) return;
+            Block plankBlock = Block.byItem(plank);
+            if (plankBlock == Blocks.AIR || !level.setBlockAndUpdate(floor, plankBlock.defaultBlockState())) {
+                insert(citizen.getNpcInventory(), new ItemStack(plank));
+            } else {
+                placed++;
+            }
+            decorationIndex++;
         }
     }
 
@@ -1060,29 +1544,21 @@ public final class StorageJob implements ProfessionJob {
     private boolean takeLogsFromNearbyCitizen(CitizenEntity storager, ServerLevel level,
                                                CivilizationData.Warehouse warehouse, int needed) {
         BlockPos center = warehouse.center();
-        // Bootstrap logs can be held by a Lumberjack anywhere inside the same nation.
-        // Restricting this search to the warehouse radius left the Storager idle while
-        // the Lumberjack was doing its job elsewhere in the territory.
-        double radius = CivilizationData.NATION_RADIUS_BLOCKS;
-        AABB area = new AABB(center.getX() - radius, center.getY() - radius, center.getZ() - radius,
-            center.getX() + radius + 1.0, center.getY() + radius + 1.0, center.getZ() + radius + 1.0);
+        // Storager stays strictly inside the Warehouse! He only takes logs from citizens who are inside the Warehouse.
+        int halfSize = Math.max(6, warehouse.radius() / 2);
+        AABB area = new AABB(center.getX() - halfSize, center.getY() - 6.0, center.getZ() - halfSize,
+            center.getX() + halfSize + 1.0, center.getY() + 6.0, center.getZ() + halfSize + 1.0);
         List<CitizenEntity> nearbyCitizens = level.getEntitiesOfClass(CitizenEntity.class, area, other ->
-            other != storager && storager.getNationId().equals(other.getNationId()));
+            other != storager && storager.getNationId().equals(other.getNationId()) && isCitizenInsideWarehouse(other, warehouse));
         nearbyCitizens.sort(Comparator.comparingDouble(storager::distanceToSqr));
-        Entity donorEntity = resourceDonorId == null ? null : level.getEntity(resourceDonorId);
-        CitizenEntity source = donorEntity instanceof CitizenEntity target ? target : null;
-        if (source == null || !nearbyCitizens.contains(source)) {
-            resourceDonorId = null;
-            source = null;
-            for (CitizenEntity candidate : nearbyCitizens) {
-                if (countLogs(candidate.getNpcInventory()) > 0) {
-                    source = candidate;
-                    resourceDonorId = candidate.getUUID();
-                    break;
-                }
+        CitizenEntity source = null;
+        for (CitizenEntity candidate : nearbyCitizens) {
+            if (countLogs(candidate.getNpcInventory()) > 0) {
+                source = candidate;
+                break;
             }
         }
-        if (source == null || countLogs(source.getNpcInventory()) <= 0) {
+        if (source == null) {
             resourceDonorId = null;
             return false;
         }
@@ -1090,22 +1566,22 @@ public final class StorageJob implements ProfessionJob {
             if (storager.getNavigation().isDone()) storager.getNavigation().moveTo(source, 0.9);
             return false;
         }
-        Item log = firstLogItem(source.getNpcInventory());
-        if (log == null) {
+        int amount = 0;
+        for (int slot = 0; slot < source.getNpcInventory().getContainerSize() && amount < needed; slot++) {
+            ItemStack stack = source.getNpcInventory().getItem(slot);
+            if (!stack.is(ItemTags.LOGS)) continue;
+            int take = Math.min(needed - amount, stack.getCount());
+            ItemStack split = stack.split(take);
+            if (stack.isEmpty()) source.getNpcInventory().setItem(slot, ItemStack.EMPTY);
+            ItemStack remainder = storager.getNpcInventory().addItem(split);
+            int actualTaken = take - remainder.getCount();
+            if (!remainder.isEmpty()) source.getNpcInventory().addItem(remainder);
+            amount += actualTaken;
+        }
+        if (amount <= 0) {
             resourceDonorId = null;
             return false;
         }
-        int amount = Math.min(needed, countItem(source.getNpcInventory(), log));
-        if (amount <= 0 || !storager.getNpcInventory().canAddItem(new ItemStack(log, amount))) {
-            resourceDonorId = null;
-            return false;
-        }
-        int remaining = removeItem(source.getNpcInventory(), log, amount);
-        if (remaining != 0) {
-            resourceDonorId = null;
-            return false;
-        }
-        storager.getNpcInventory().addItem(new ItemStack(log, amount));
         source.getNpcInventory().setChanged();
         storager.getNpcInventory().setChanged();
         resourceDonorId = null;
@@ -1123,7 +1599,12 @@ public final class StorageJob implements ProfessionJob {
                 int z = center.getZ() + row - blueprint.depth() / 2;
                 BlockPos pos = new BlockPos(x, warehouse.y(), z);
                 if (!level.hasChunkAt(pos) || !citizen.isInsideNation(pos)) continue;
-                if (!level.getBlockState(pos).isAir()
+                BlockState atPos = level.getBlockState(pos);
+                if (!atPos.isAir() && com.aicivilization.profession.BuilderJob.isClearableVegetation(atPos)) {
+                    level.destroyBlock(pos, true, citizen);
+                    atPos = level.getBlockState(pos);
+                }
+                if (!atPos.isAir()
                     || !level.getBlockState(pos.below()).isFaceSturdy(level, pos.below(), Direction.UP)) continue;
                 if (!level.getEntitiesOfClass(CitizenEntity.class, new AABB(pos)).isEmpty()) continue;
                 return pos;
@@ -1151,26 +1632,48 @@ public final class StorageJob implements ProfessionJob {
         return false;
     }
 
+    private void depositExcessStoragerInventory(CitizenEntity storager, ServerLevel level, List<BlockPos> chests) {
+        if (chests.isEmpty()) return;
+        boolean movedAny = false;
+        for (int slot = 0; slot < storager.getNpcInventory().getContainerSize(); slot++) {
+            ItemStack stack = storager.getNpcInventory().getItem(slot);
+            if (stack.isEmpty() || stack.is(ItemTags.AXES)) continue;
+            for (BlockPos chestPos : chests) {
+                if (!(level.getBlockEntity(chestPos) instanceof ChestBlockEntity chest)) continue;
+                ItemStack remainder = insert(chest, stack.copy());
+                int moved = stack.getCount() - remainder.getCount();
+                if (moved > 0) {
+                    stack.shrink(moved);
+                    if (stack.isEmpty()) storager.getNpcInventory().setItem(slot, ItemStack.EMPTY);
+                    chest.setChanged();
+                    movedAny = true;
+                }
+                if (stack.isEmpty()) break;
+            }
+        }
+        if (movedAny) {
+            storager.getNpcInventory().setChanged();
+        }
+    }
+
     public static boolean depositAllResources(CitizenEntity citizen, ServerLevel level) {
-        CivilizationData.Warehouse warehouse = CivilizationData.get(level).warehouse(citizen.getNationId());
+        CivilizationData data = CivilizationData.get(level);
+        CivilizationData.Warehouse warehouse = data.warehouse(citizen.getNationId());
         if (warehouse == null || !warehouse.dimension().equals(level.dimension().location())) return false;
         List<BlockPos> chests = findChests(level, warehouse);
-        if (chests.isEmpty()) return false;
 
         boolean depositedAny = false;
         for (int slot = 0; slot < citizen.getNpcInventory().getContainerSize(); slot++) {
             ItemStack stack = citizen.getNpcInventory().getItem(slot);
             if (stack.isEmpty()) continue;
-            Item item = stack.getItem();
-            if (item == Items.TORCH
-                || item == Items.NETHERITE_PICKAXE || item == Items.DIAMOND_PICKAXE
-                || item == Items.IRON_PICKAXE || item == Items.STONE_PICKAXE
-                || item == Items.WOODEN_PICKAXE || item == Items.NETHERITE_AXE
-                || item == Items.DIAMOND_AXE || item == Items.IRON_AXE
-                || item == Items.STONE_AXE || item == Items.WOODEN_AXE) continue;
+            if (stack.is(Items.TORCH)
+                || stack.is(ItemTags.PICKAXES)
+                || stack.is(ItemTags.AXES)
+                || stack.is(ItemTags.SHOVELS)) continue;
 
+            // 1. Try inserting into any Warehouse chest (including partial fits)
             for (BlockPos chestPos : chests) {
-                if (level.getBlockEntity(chestPos) instanceof ChestBlockEntity chest && canFit(chest, stack)) {
+                if (level.getBlockEntity(chestPos) instanceof ChestBlockEntity chest) {
                     ItemStack remainder = insert(chest, stack.copy());
                     int moved = stack.getCount() - remainder.getCount();
                     if (moved > 0) {
@@ -1180,6 +1683,22 @@ public final class StorageJob implements ProfessionJob {
                         depositedAny = true;
                     }
                     if (stack.isEmpty()) break;
+                }
+            }
+
+            // 2. Fallback: if chests are not built yet or full, hand resources to the Storager inside the Warehouse!
+            if (!stack.isEmpty()) {
+                UUID storagerId = data.storager(citizen.getNationId());
+                if (storagerId != null && level.getEntity(storagerId) instanceof CitizenEntity storager
+                    && storager != citizen && isCitizenInsideWarehouse(storager, warehouse)) {
+                    ItemStack remainder = insert(storager.getNpcInventory(), stack.copy());
+                    int moved = stack.getCount() - remainder.getCount();
+                    if (moved > 0) {
+                        stack.shrink(moved);
+                        if (stack.isEmpty()) citizen.getNpcInventory().setItem(slot, ItemStack.EMPTY);
+                        storager.getNpcInventory().setChanged();
+                        depositedAny = true;
+                    }
                 }
             }
         }
