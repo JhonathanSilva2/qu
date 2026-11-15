@@ -1,5 +1,6 @@
 package com.aicivilization.storage;
 
+import com.aicivilization.blueprint.GridBlueprint;
 import com.aicivilization.data.CivilizationData;
 import com.aicivilization.entity.CitizenEntity;
 import net.minecraft.core.BlockPos;
@@ -69,6 +70,7 @@ public final class StorageJob implements ProfessionJob {
     private int decorationIndex;
     private boolean decoratingFence;
     private UUID resourceDonorId;
+    private static GridBlueprint WAREHOUSE_BLUEPRINT;
 
     @Override
     public String getId() {
@@ -185,7 +187,9 @@ public final class StorageJob implements ProfessionJob {
             }
         }
         List<BlockPos> chests = findChests(level, warehouse);
-        if (!chests.isEmpty()) data.markWarehousePlotPrepared(nationId);
+        boolean validInbox = warehouse.hasInbox()
+            && level.getBlockEntity(warehouse.inbox()) instanceof ChestBlockEntity;
+        if (validInbox || hasBlueprintChest(level, warehouse)) data.markWarehousePlotPrepared(nationId);
         if (!data.warehousePlotPrepared(nationId)) {
             boolean firstRequest = !data.warehousePlotRequested(nationId);
             data.requestWarehousePlot(nationId);
@@ -195,7 +199,9 @@ public final class StorageJob implements ProfessionJob {
                     citizen.getNavigation().moveTo(warehouse.x() + 0.5, warehouse.y(), warehouse.z() + 0.5, 0.9);
                 return;
             }
-            processRequests(citizen, level, data, warehouse, chests, null);
+            // Before the Builder finishes the plot, nearby unrelated chests are not
+            // part of this warehouse and must not block inventory-only tool requests.
+            if (processRequests(citizen, level, data, warehouse, List.of(), null)) return;
             if (chests.isEmpty()) takeLogsFromNearbyCitizen(citizen, level, warehouse, 2);
             return;
         }
@@ -219,7 +225,7 @@ public final class StorageJob implements ProfessionJob {
         if (!chests.contains(inbox)) chests = findChests(level, warehouse);
         // Tool requests have priority over sorting incoming resources. Their materials can
         // still be counted in the inbox, so the Storager can craft before moving the items.
-        processRequests(citizen, level, data, warehouse, chests, inbox);
+        if (processRequests(citizen, level, data, warehouse, chests, inbox)) return;
         if (chests.size() < 2 && hasPendingSort((ChestBlockEntity) level.getBlockEntity(inbox))) {
             if (!buildChest(citizen, level, warehouse, chests, false)) return;
             chests = findChests(level, warehouse);
@@ -263,7 +269,7 @@ public final class StorageJob implements ProfessionJob {
         List<BlockPos> chests = findChests(level, warehouse);
         if (!warehouse.hasInbox() || !(level.getBlockEntity(warehouse.inbox()) instanceof ChestBlockEntity))
             return "Construindo o baú principal";
-        if (!data.openStorageRequests(citizen.getNationId()).isEmpty()) return "Fabricando ferramentas solicitadas";
+        if (!data.openStorageRequests(citizen.getNationId()).isEmpty()) return "Atendendo pedidos e entregando ferramentas";
         ChestBlockEntity inbox = (ChestBlockEntity) level.getBlockEntity(warehouse.inbox());
         if (hasPendingSort(inbox)) return "Organizando os itens nos baús";
         if (chests.size() < 3) return "Ampliando o armazém com mais baús";
@@ -422,9 +428,9 @@ public final class StorageJob implements ProfessionJob {
         return !stack.isEmpty() && Block.byItem(stack.getItem()).defaultBlockState().is(BlockTags.SAPLINGS);
     }
 
-    /** Returns true while walking to or taking a requested tool from the warehouse. */
+    /** Returns true while the Storager is fulfilling a matching tool request. */
     public static boolean retrieveBestAxe(CitizenEntity citizen, ServerLevel level) {
-        return retrieveBestTool(citizen, level, AXE_RECIPES, "machado");
+        return retrieveBestTool(citizen, level, AXE_RECIPES);
     }
 
     public static boolean retrieveBestPickaxe(CitizenEntity citizen, ServerLevel level) {
@@ -436,7 +442,7 @@ public final class StorageJob implements ProfessionJob {
         List<ToolRecipe> eligible = PICKAXE_RECIPES.stream()
             .filter(recipe -> pickaxeTier(recipe.tool()) >= minimumTier).toList();
         if (eligible.isEmpty()) return false;
-        return retrieveBestTool(citizen, level, eligible, "picareta");
+        return retrieveBestTool(citizen, level, eligible);
     }
 
     public static String pickaxeRequestId(int minimumTier) {
@@ -448,7 +454,7 @@ public final class StorageJob implements ProfessionJob {
     }
 
     public static boolean retrieveBestShovel(CitizenEntity citizen, ServerLevel level) {
-        return retrieveBestTool(citizen, level, SHOVEL_RECIPES, "pá");
+        return retrieveBestTool(citizen, level, SHOVEL_RECIPES);
     }
 
     /** Walks to the nation's Storager and transfers an already fulfilled material request. */
@@ -480,53 +486,16 @@ public final class StorageJob implements ProfessionJob {
         return -1;
     }
 
-    private static boolean retrieveBestTool(CitizenEntity citizen, ServerLevel level,
-                                            List<ToolRecipe> recipes, String toolName) {
-        CivilizationData.Warehouse warehouse = CivilizationData.get(level).warehouse(citizen.getNationId());
-        if (warehouse == null || !warehouse.dimension().equals(level.dimension().location())) return false;
-        UUID storagerId = CivilizationData.get(level).storager(citizen.getNationId());
-        Entity storagerEntity = storagerId == null ? null : level.getEntity(storagerId);
-        if (storagerEntity instanceof CitizenEntity storager && storager != citizen) {
-            for (ToolRecipe recipe : recipes) {
-                int slot = findItem(storager.getNpcInventory(), recipe.tool());
-                if (slot < 0) continue;
-                if (citizen.distanceToSqr(storager) > 16.0) {
-                    if (citizen.getNavigation().isDone()) citizen.getNavigation().moveTo(storager, 0.9);
-                    return true;
-                }
-                ItemStack toolStack = storager.getNpcInventory().getItem(slot).split(1);
-                if (storager.getNpcInventory().getItem(slot).isEmpty()) storager.getNpcInventory().setItem(slot, ItemStack.EMPTY);
-                storager.getNpcInventory().setChanged();
-                citizen.setItemSlot(net.minecraft.world.entity.EquipmentSlot.MAINHAND, toolStack);
-                citizen.announce("Peguei a melhor " + toolName + " no Storager e vou voltar ao trabalho.");
-                return true;
-            }
-        }
-        List<BlockPos> chests = findChests(level, warehouse);
-        for (ToolRecipe recipe : recipes) {
-            for (BlockPos pos : chests) {
-                if (!(level.getBlockEntity(pos) instanceof ChestBlockEntity chest)) continue;
-                int slot = findItem(chest, recipe.tool());
-                if (slot < 0) continue;
-                if (citizen.distanceToSqr(pos.getX() + 0.5, pos.getY(), pos.getZ() + 0.5) > 16.0) {
-                    citizen.getNavigation().moveTo(pos.getX() + 0.5, pos.getY(), pos.getZ() + 0.5, 0.9);
-                    return true;
-                }
-                ItemStack toolStack = chest.getItem(slot).split(1);
-                if (chest.getItem(slot).isEmpty()) chest.setItem(slot, ItemStack.EMPTY);
-                chest.setChanged();
-                citizen.setItemSlot(net.minecraft.world.entity.EquipmentSlot.MAINHAND, toolStack);
-                citizen.announce("Peguei a melhor " + toolName + " disponível no armazém e vou voltar ao trabalho.");
-                return true;
-            }
-        }
-        return false;
+    private static boolean retrieveBestTool(CitizenEntity citizen, ServerLevel level, List<ToolRecipe> recipes) {
+        CivilizationData data = CivilizationData.get(level);
+        // Requests are delivered by the Storager; citizens must not take stock directly.
+        return hasPendingToolRequest(data, citizen, recipes);
     }
 
-    private void processRequests(CitizenEntity citizen, ServerLevel level, CivilizationData data,
-                                 CivilizationData.Warehouse warehouse, List<BlockPos> chestPositions, BlockPos inboxPos) {
+    private boolean processRequests(CitizenEntity citizen, ServerLevel level, CivilizationData data,
+                                    CivilizationData.Warehouse warehouse, List<BlockPos> chestPositions, BlockPos inboxPos) {
         ChestBlockEntity inbox = inboxPos != null && level.getBlockEntity(inboxPos) instanceof ChestBlockEntity chest ? chest : null;
-        if (!chestPositions.isEmpty() && inbox == null) return;
+        if (!chestPositions.isEmpty() && inbox == null) return false;
         List<CivilizationData.StorageRequest> requests = new ArrayList<>(data.openStorageRequests(citizen.getNationId()));
         requests.sort(Comparator.comparingInt(request -> isToolRequest(request.itemId()) ? 0 : 1));
         for (CivilizationData.StorageRequest request : requests) {
@@ -554,7 +523,7 @@ public final class StorageJob implements ProfessionJob {
                 .filter(candidate -> countItem(citizen.getNpcInventory(), chestPositions, level, candidate.tool()) > 0)
                 .findFirst().orElse(null);
             if (stocked != null) {
-                data.fulfillStorageRequest(request.id());
+                if (deliverRequestedTool(citizen, level, data, request, stocked, chestPositions)) return true;
                 continue;
             }
             ToolRecipe recipe = findCraftableTool(citizen.getNpcInventory(), chestPositions, level, recipes);
@@ -578,38 +547,111 @@ public final class StorageJob implements ProfessionJob {
             recipe = findCraftableTool(citizen.getNpcInventory(), chestPositions, level, recipes);
             if (recipe == null) continue;
             ItemStack toolStack = new ItemStack(recipe.tool());
-            if (chestPositions.isEmpty()) {
-                boolean consumedMaterial = recipe.usesPlanks()
-                    ? consumeTaggedItems(citizen.getNpcInventory(), chestPositions, level, ItemTags.PLANKS, recipe.materialCount())
-                    : consumeItem(citizen.getNpcInventory(), chestPositions, level, recipe.material(), recipe.materialCount());
-                if (!consumedMaterial || !consumeItem(citizen.getNpcInventory(), chestPositions, level, Items.STICK, 2)) continue;
-                ItemStack remainder = citizen.getNpcInventory().addItem(toolStack);
-                if (!remainder.isEmpty()) continue;
-                data.fulfillStorageRequest(request.id());
-                citizen.announce("Fabriquei " + toolName + " e vou guardar comigo até a warehouse ficar pronta.");
-                continue;
-            }
-            ChestBlockEntity destination = null;
-            for (BlockPos pos : chestPositions) {
-                if (pos.equals(inboxPos)) continue;
-                if (level.getBlockEntity(pos) instanceof ChestBlockEntity chest && canAccept(chest, toolStack)) {
-                    destination = chest;
-                    break;
-                }
-            }
-            if (destination == null) {
-                buildChest(citizen, level, warehouse, chestPositions, false);
-                return;
-            }
+            if (!citizen.getNpcInventory().canAddItem(toolStack)) continue;
             boolean consumedMaterial = recipe.usesPlanks()
                 ? consumeTaggedItems(citizen.getNpcInventory(), chestPositions, level, ItemTags.PLANKS, recipe.materialCount())
                 : consumeItem(citizen.getNpcInventory(), chestPositions, level, recipe.material(), recipe.materialCount());
             if (!consumedMaterial || !consumeItem(citizen.getNpcInventory(), chestPositions, level, Items.STICK, 2)) continue;
-            ItemStack remainder = insert(destination, toolStack);
+            ItemStack remainder = citizen.getNpcInventory().addItem(toolStack);
             if (!remainder.isEmpty()) continue;
-            data.fulfillStorageRequest(request.id());
-            citizen.announce("Fabriquei a melhor " + toolName + " que os recursos do armazém permitiram.");
+            citizen.getNpcInventory().setChanged();
+            citizen.announce("Fabriquei " + toolName + " e vou levar ao cidadão que pediu.");
+            if (deliverRequestedTool(citizen, level, data, request, recipe, chestPositions)) return true;
         }
+        return false;
+    }
+
+    private boolean deliverRequestedTool(CitizenEntity storager, ServerLevel level, CivilizationData data,
+                                         CivilizationData.StorageRequest request, ToolRecipe recipe,
+                                         List<BlockPos> chestPositions) {
+        Entity targetEntity = level.getEntity(request.requesterId());
+        if (!(targetEntity instanceof CitizenEntity requester) || requester == storager
+            || !requester.getNationId().equals(storager.getNationId())) return false;
+
+        if (storager.distanceToSqr(requester) > 16.0) {
+            if (findItem(storager.getNpcInventory(), recipe.tool()) < 0) {
+                if (!storager.getNpcInventory().canAddItem(new ItemStack(recipe.tool()))) return false;
+                for (BlockPos pos : chestPositions) {
+                    if (!(level.getBlockEntity(pos) instanceof ChestBlockEntity chest)) continue;
+                    int slot = findItem(chest, recipe.tool());
+                    if (slot < 0) continue;
+                    ItemStack tool = chest.getItem(slot).split(1);
+                    if (chest.getItem(slot).isEmpty()) chest.setItem(slot, ItemStack.EMPTY);
+                    chest.setChanged();
+                    ItemStack remainder = storager.getNpcInventory().addItem(tool);
+                    if (!remainder.isEmpty()) insert(chest, remainder);
+                    storager.getNpcInventory().setChanged();
+                    break;
+                }
+            }
+            if (findItem(storager.getNpcInventory(), recipe.tool()) < 0) return false;
+            if (storager.getNavigation().isDone()) storager.getNavigation().moveTo(requester, 0.9);
+            return true;
+        }
+
+        ItemStack delivered = new ItemStack(recipe.tool());
+        boolean putInInventory = requester.getNpcInventory().canAddItem(delivered);
+        boolean putInHand = requester.getMainHandItem().isEmpty();
+        if (!putInInventory && !putInHand) return false;
+
+        ItemStack removed = takeOneTool(storager, level, chestPositions, recipe.tool());
+        if (removed.isEmpty()) return false;
+        if (putInInventory) requester.getNpcInventory().addItem(removed);
+        else requester.setItemSlot(net.minecraft.world.entity.EquipmentSlot.MAINHAND, removed);
+        requester.getNpcInventory().setChanged();
+        data.fulfillStorageRequest(request.id());
+        storager.announce("Entreguei " + BuiltInRegistries.ITEM.getKey(recipe.tool()).getPath()
+            + " para " + requester.getPersonalName() + ".");
+        requester.announce("Recebi a ferramenta que pedi ao Storager.");
+        return true;
+    }
+
+    private static ItemStack takeOneTool(CitizenEntity storager, ServerLevel level,
+                                         List<BlockPos> chestPositions, Item toolItem) {
+        int inventorySlot = findItem(storager.getNpcInventory(), toolItem);
+        if (inventorySlot >= 0) {
+            ItemStack stack = storager.getNpcInventory().getItem(inventorySlot).split(1);
+            if (storager.getNpcInventory().getItem(inventorySlot).isEmpty())
+                storager.getNpcInventory().setItem(inventorySlot, ItemStack.EMPTY);
+            storager.getNpcInventory().setChanged();
+            return stack;
+        }
+        for (BlockPos pos : chestPositions) {
+            if (!(level.getBlockEntity(pos) instanceof ChestBlockEntity chest)) continue;
+            int slot = findItem(chest, toolItem);
+            if (slot < 0) continue;
+            ItemStack stack = chest.getItem(slot).split(1);
+            if (chest.getItem(slot).isEmpty()) chest.setItem(slot, ItemStack.EMPTY);
+            chest.setChanged();
+            return stack;
+        }
+        return ItemStack.EMPTY;
+    }
+
+    private static boolean hasPendingToolRequest(CivilizationData data, CitizenEntity requester,
+                                                 List<ToolRecipe> recipes) {
+        for (CivilizationData.StorageRequest request : data.openStorageRequests(requester.getNationId())) {
+            if (!request.requesterId().equals(requester.getUUID())) continue;
+            if (request.itemId().equals(BEST_AXE_REQUEST_ID)
+                && recipes.stream().anyMatch(recipe -> recipe.tool() == Items.WOODEN_AXE)) return true;
+            if (request.itemId().equals(BEST_SHOVEL_REQUEST_ID)
+                && recipes.stream().anyMatch(recipe -> recipe.tool() == Items.WOODEN_SHOVEL)) return true;
+            if (request.itemId().equals(BEST_PICKAXE_REQUEST_ID)
+                || request.itemId().startsWith(BEST_PICKAXE_REQUEST_ID + ".tier_")) {
+                int minimumTier;
+                if (request.itemId().startsWith(BEST_PICKAXE_REQUEST_ID + ".tier_")) {
+                    try {
+                        minimumTier = Integer.parseInt(request.itemId()
+                            .substring((BEST_PICKAXE_REQUEST_ID + ".tier_").length()));
+                    } catch (NumberFormatException ignored) {
+                        minimumTier = 0;
+                    }
+                } else minimumTier = 0;
+                int requestedTier = minimumTier;
+                if (recipes.stream().anyMatch(recipe -> pickaxeTier(recipe.tool()) >= requestedTier)) return true;
+            }
+        }
+        return false;
     }
 
     private boolean isToolRequest(String itemId) {
@@ -969,7 +1011,7 @@ public final class StorageJob implements ProfessionJob {
 
     private boolean buildChest(CitizenEntity citizen, ServerLevel level, CivilizationData.Warehouse warehouse,
                                List<BlockPos> existingChests, boolean firstChest) {
-        BlockPos place = firstChest ? warehouse.center() : findChestPlacement(citizen, level, warehouse, false);
+        BlockPos place = findChestPlacement(citizen, level, warehouse);
         if (place == null) {
             if (citizen.tickCount % 200 == 0) citizen.announce("Não encontrei espaço livre dentro da área do armazém para outro baú.");
             return false;
@@ -1048,9 +1090,15 @@ public final class StorageJob implements ProfessionJob {
             return false;
         }
         int amount = Math.min(needed, countItem(source.getNpcInventory(), log));
-        if (amount <= 0 || !storager.getNpcInventory().canAddItem(new ItemStack(log, amount))) return false;
+        if (amount <= 0 || !storager.getNpcInventory().canAddItem(new ItemStack(log, amount))) {
+            resourceDonorId = null;
+            return false;
+        }
         int remaining = removeItem(source.getNpcInventory(), log, amount);
-        if (remaining != 0) return false;
+        if (remaining != 0) {
+            resourceDonorId = null;
+            return false;
+        }
         storager.getNpcInventory().addItem(new ItemStack(log, amount));
         source.getNpcInventory().setChanged();
         storager.getNpcInventory().setChanged();
@@ -1059,53 +1107,83 @@ public final class StorageJob implements ProfessionJob {
     }
 
     private BlockPos findChestPlacement(CitizenEntity citizen, ServerLevel level,
-                                        CivilizationData.Warehouse warehouse, boolean firstChest) {
+                                        CivilizationData.Warehouse warehouse) {
         BlockPos center = warehouse.center();
-        int radius = warehouse.radius();
-        List<BlockPos> candidates = new ArrayList<>();
-        // Fixed chest rows with four blocks between row centers leave a two-block aisle.
-        // One empty block between chests keeps them from merging into double chests.
-        for (int dz = -radius + 2; dz <= radius - 2; dz += 4) {
-            for (int dx = -radius + 2; dx <= radius - 2; dx += 2) {
-                if ((long) dx * dx + (long) dz * dz > (long) radius * radius) continue;
-                int x = center.getX() + dx;
-                int z = center.getZ() + dz;
-                BlockPos probe = new BlockPos(x, center.getY(), z);
-                if (!level.hasChunkAt(probe)) continue;
-                int y = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
-                BlockPos pos = new BlockPos(x, y, z);
-                if (dx * dx + dz * dz < 4) continue;
-                if (!level.getBlockState(pos).isAir() || !level.getBlockState(pos.below()).isFaceSturdy(level, pos.below(), Direction.UP)) continue;
-                if (!level.getEntitiesOfClass(CitizenEntity.class, new net.minecraft.world.phys.AABB(pos)).isEmpty()) continue;
-                if (!firstChest && (level.getBlockState(pos.east()).is(Blocks.CHEST) || level.getBlockState(pos.west()).is(Blocks.CHEST)
-                    || level.getBlockState(pos.north()).is(Blocks.CHEST) || level.getBlockState(pos.south()).is(Blocks.CHEST))) continue;
-                candidates.add(pos);
+        GridBlueprint blueprint = warehouseBlueprint(level);
+        for (int row = 0; row < blueprint.depth(); row++) {
+            for (int column = 0; column < blueprint.width(); column++) {
+                if (blueprint.cellAt(column, row) != 'A') continue;
+                int x = center.getX() + column - blueprint.width() / 2;
+                int z = center.getZ() + row - blueprint.depth() / 2;
+                BlockPos pos = new BlockPos(x, warehouse.y(), z);
+                if (!level.hasChunkAt(pos) || !citizen.isInsideNation(pos)) continue;
+                if (!level.getBlockState(pos).isAir()
+                    || !level.getBlockState(pos.below()).isFaceSturdy(level, pos.below(), Direction.UP)) continue;
+                if (!level.getEntitiesOfClass(CitizenEntity.class, new AABB(pos)).isEmpty()) continue;
+                return pos;
             }
         }
-        candidates.sort(Comparator.comparingInt((BlockPos pos) -> pos.getZ())
-            .thenComparingInt(BlockPos::getX));
-        return candidates.stream().filter(pos -> CivilizationData.get(level).findNationAt(pos, level.dimension().location())
-            != null && CivilizationData.get(level).findNationAt(pos, level.dimension().location()).id().equals(warehouse.nationId()))
-            .findFirst().orElse(null);
+        return null;
+    }
+
+    private static GridBlueprint warehouseBlueprint(ServerLevel level) {
+        if (WAREHOUSE_BLUEPRINT == null) WAREHOUSE_BLUEPRINT = GridBlueprint.load(level, "warehouse_10x10");
+        return WAREHOUSE_BLUEPRINT;
+    }
+
+    private static boolean hasBlueprintChest(ServerLevel level, CivilizationData.Warehouse warehouse) {
+        BlockPos center = warehouse.center();
+        GridBlueprint blueprint = warehouseBlueprint(level);
+        for (int row = 0; row < blueprint.depth(); row++) {
+            for (int column = 0; column < blueprint.width(); column++) {
+                if (blueprint.cellAt(column, row) != 'A') continue;
+                BlockPos pos = new BlockPos(center.getX() + column - blueprint.width() / 2,
+                    warehouse.y(), center.getZ() + row - blueprint.depth() / 2);
+                if (level.hasChunkAt(pos) && level.getBlockEntity(pos) instanceof ChestBlockEntity) return true;
+            }
+        }
+        return false;
     }
 
     private static List<BlockPos> findChests(ServerLevel level, CivilizationData.Warehouse warehouse) {
         List<BlockPos> result = new ArrayList<>();
         BlockPos center = warehouse.center();
+        GridBlueprint blueprint = warehouseBlueprint(level);
+        for (int row = 0; row < blueprint.depth(); row++) {
+            for (int column = 0; column < blueprint.width(); column++) {
+                if (blueprint.cellAt(column, row) != 'A') continue;
+                BlockPos pos = new BlockPos(center.getX() + column - blueprint.width() / 2,
+                    warehouse.y(), center.getZ() + row - blueprint.depth() / 2);
+                addChestIfPresent(level, result, pos);
+            }
+        }
+        if (warehouse.hasInbox()) addChestIfPresent(level, result, warehouse.inbox());
+
+        // Keep access to chests from the older warehouse grid while excluding
+        // unrelated player chests in the surrounding area.
         int radius = warehouse.radius();
-        for (int dx = -radius; dx <= radius; dx++) {
-            for (int dz = -radius; dz <= radius; dz++) {
-                if ((long) dx * dx + (long) dz * dz > (long) radius * radius) continue;
+        int firstDx = -radius + 2;
+        int firstDz = -radius + 2;
+        for (int dz = firstDz; dz <= radius - 2; dz += 4) {
+            for (int dx = firstDx; dx <= radius - 2; dx += 2) {
+                long distanceSquared = (long) dx * dx + (long) dz * dz;
+                if (distanceSquared < 4 || distanceSquared > (long) radius * radius) continue;
                 int x = center.getX() + dx;
                 int z = center.getZ() + dz;
-                for (int y = Math.max(level.getMinY(), center.getY() - 6); y <= Math.min(level.getMaxY(), center.getY() + 10); y++) {
-                    BlockPos pos = new BlockPos(x, y, z);
-                    if (level.hasChunkAt(pos) && level.getBlockEntity(pos) instanceof ChestBlockEntity) result.add(pos);
+                for (int y = Math.max(level.getMinY(), center.getY() - 6);
+                     y <= Math.min(level.getMaxY(), center.getY() + 10); y++) {
+                    addChestIfPresent(level, result, new BlockPos(x, y, z));
                 }
             }
         }
         result.sort(Comparator.comparingDouble(center::distSqr));
         return result;
+    }
+
+    private static void addChestIfPresent(ServerLevel level, List<BlockPos> chests, BlockPos pos) {
+        if (level.hasChunkAt(pos) && level.getBlockEntity(pos) instanceof ChestBlockEntity && !chests.contains(pos)) {
+            chests.add(pos);
+        }
     }
 
     private boolean hasPendingSort(ChestBlockEntity inbox) {

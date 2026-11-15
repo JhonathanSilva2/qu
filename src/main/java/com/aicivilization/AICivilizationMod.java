@@ -1,21 +1,26 @@
 package com.aicivilization;
 
 import com.aicivilization.config.ModConfig;
+import com.aicivilization.blueprint.GridBlueprint;
 import com.aicivilization.entity.CitizenEntity;
 import com.aicivilization.entity.ModEntities;
 import com.aicivilization.storage.StorageJob;
+import com.aicivilization.network.StorageQueuePayload;
 import com.aicivilization.data.CivilizationData;
 import com.aicivilization.util.ChatMessages;
 import com.mojang.logging.LogUtils;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
+import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
+import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
 import net.minecraft.commands.Commands;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.level.levelgen.Heightmap;
+import net.minecraft.tags.BlockTags;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.entity.BannerBlockEntity;
@@ -54,7 +59,7 @@ public class AICivilizationMod implements ModInitializer {
         "/aiciv list warehouse — mostra os armazéns das nações",
         "/aiciv warehouse set <radius> — define a área do armazém da sua nação",
         "/aiciv warehouse status — mostra o baú de entrada e os pedidos",
-        "/aiciv storage queue — lista pedidos abertos de recursos e ferramentas",
+        "/aiciv storage queue — lista pedidos; tecla K abre o painel visual",
         "/aiciv debug status <name|slot> — mostra posição, alvo e motivo provável de bloqueio",
         "/aiciv debug watch <name|slot> — acompanha o estado do cidadão a cada 2 segundos por 60 segundos",
         "/aiciv debug stop — encerra o rastreamento",
@@ -83,6 +88,25 @@ public class AICivilizationMod implements ModInitializer {
     public void onInitialize() {
         ModConfig.load();
         ModEntities.initialize();
+        PayloadTypeRegistry.playC2S().register(StorageQueuePayload.TYPE, StorageQueuePayload.CODEC);
+        PayloadTypeRegistry.playS2C().register(StorageQueuePayload.TYPE, StorageQueuePayload.CODEC);
+        ServerPlayNetworking.registerGlobalReceiver(StorageQueuePayload.TYPE, (payload, context) -> {
+            if (payload.response()) return;
+            ServerPlayer player = context.player();
+            ServerLevel level = (ServerLevel) player.level();
+            CivilizationData data = CivilizationData.get(level);
+            CivilizationData.Nation nation = data.findNationAt(player.blockPosition(), level.dimension().location());
+            String content;
+            if (nation == null) {
+                content = "Você está fora do território de uma civilização.";
+            } else {
+                List<CivilizationData.StorageRequest> requests = data.openStorageRequests(nation.id());
+                content = requests.isEmpty() ? "Nenhum pedido pendente para o Storager."
+                    : requests.stream().map(request -> formatStorageRequest(level, request)).limit(64)
+                        .collect(java.util.stream.Collectors.joining("\n"));
+            }
+            ServerPlayNetworking.send(player, new StorageQueuePayload(true, content));
+        });
         ServerLivingEntityEvents.AFTER_DEATH.register((entity, damageSource) -> {
             if (entity instanceof CitizenEntity citizen && entity.level() instanceof ServerLevel level) {
                 Component message = Component.literal(citizen.getDisplayNameText() + " morreu.")
@@ -195,6 +219,19 @@ public class AICivilizationMod implements ModInitializer {
                     .then(Commands.literal("size")
                         .executes(context -> showNationSize(context.getSource()))))));
         LOGGER.info("AI Civilization inicializado para Minecraft 1.21.10");
+    }
+
+    private static String formatStorageRequest(ServerLevel level, CivilizationData.StorageRequest request) {
+        Entity requester = level.getEntity(request.requesterId());
+        String name = requester instanceof CitizenEntity citizen ? citizen.getPersonalName() : "Cidadão";
+        String item = request.itemId().equals(StorageJob.BEST_AXE_REQUEST_ID) ? "melhor machado disponível"
+            : request.itemId().equals(StorageJob.BEST_PICKAXE_REQUEST_ID) ? "melhor picareta disponível"
+            : request.itemId().startsWith(StorageJob.BEST_PICKAXE_REQUEST_ID + ".tier_")
+                ? "picareta tier " + request.itemId().substring((StorageJob.BEST_PICKAXE_REQUEST_ID + ".tier_").length())
+            : request.itemId().equals(StorageJob.BEST_SHOVEL_REQUEST_ID) ? "melhor pá disponível"
+            : request.itemId().startsWith("ai_civilization:resource:")
+                ? request.itemId().substring("ai_civilization:resource:".length()) : request.itemId();
+        return name + " — " + request.count() + "x " + item;
     }
 
     private int spawnNpc(ServerPlayer player) {
@@ -310,10 +347,6 @@ public class AICivilizationMod implements ModInitializer {
                 spawnPositions.get(index), center, level.dimension().location());
             citizen.setNation(nation.id(), nation.name());
         }
-        level.setBlockAndUpdate(center, standardFor(nation.name()).defaultBlockState());
-        BlockEntity bannerEntity = level.getBlockEntity(center);
-        if (bannerEntity instanceof BannerBlockEntity banner) banner.setChanged();
-
         boolean jobsStarted = citizens.get(0).startLumberjack()
             && citizens.get(1).startStorage()
             && citizens.get(2).startMiner()
@@ -325,6 +358,7 @@ public class AICivilizationMod implements ModInitializer {
             player.sendSystemMessage(ChatMessages.error("A civilização não pôde iniciar os quatro trabalhos; tente em outra área."));
             return 0;
         }
+        placeVillageCenterBlueprint(level, center, standardFor(nation.name()));
         citizens.getFirst().announce("Fundei " + nation.name() + "! Nossa equipe já está trabalhando.");
         player.sendSystemMessage(ChatMessages.success("Civilization " + nation.name() + " foi criada."));
         player.sendSystemMessage(ChatMessages.info(citizens.get(0).getPersonalName() + " foi criado como LumberJack."));
@@ -332,6 +366,38 @@ public class AICivilizationMod implements ModInitializer {
         player.sendSystemMessage(ChatMessages.info(citizens.get(2).getPersonalName() + " foi criado como Miner."));
         player.sendSystemMessage(ChatMessages.info(citizens.get(3).getPersonalName() + " foi criado como Builder."));
         return 1;
+    }
+
+    private void placeVillageCenterBlueprint(ServerLevel level, BlockPos center,
+                                             net.minecraft.world.level.block.Block standard) {
+        GridBlueprint blueprint = GridBlueprint.load(level, "village_center_7x5");
+        int floorY = center.getY() - 1;
+        for (int row = 0; row < blueprint.depth(); row++) {
+            for (int column = 0; column < blueprint.width(); column++) {
+                char cell = blueprint.cellAt(column, row);
+                if (cell != 'P' && cell != 'S') continue;
+                int x = center.getX() + column - blueprint.width() / 2;
+                int z = center.getZ() + row - blueprint.depth() / 2;
+                BlockPos floor = new BlockPos(x, floorY, z);
+                BlockPos above = floor.above();
+                if (!level.hasChunkAt(floor)) continue;
+                boolean naturalFloor = !level.getBlockState(floor).hasBlockEntity()
+                    && isNaturalPlazaGround(level.getBlockState(floor));
+                if (cell == 'S' && above.equals(center)) {
+                    if (naturalFloor) level.setBlockAndUpdate(floor, Blocks.OAK_PLANKS.defaultBlockState());
+                    level.setBlockAndUpdate(above, standard.defaultBlockState());
+                    BlockEntity bannerEntity = level.getBlockEntity(above);
+                    if (bannerEntity instanceof BannerBlockEntity banner) banner.setChanged();
+                } else if (naturalFloor && level.getBlockState(above).canBeReplaced()) {
+                    level.setBlockAndUpdate(floor, Blocks.OAK_PLANKS.defaultBlockState());
+                }
+            }
+        }
+    }
+
+    private boolean isNaturalPlazaGround(net.minecraft.world.level.block.state.BlockState state) {
+        return state.is(BlockTags.DIRT) || state.is(Blocks.GRASS_BLOCK) || state.is(Blocks.PODZOL)
+            || state.is(Blocks.MYCELIUM) || state.is(Blocks.MOSS_BLOCK);
     }
 
     private int deleteCivilization(ServerPlayer player, String name) {
