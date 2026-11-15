@@ -4,6 +4,7 @@ import com.aicivilization.AICivilizationMod;
 import com.aicivilization.data.CivilizationData;
 import com.aicivilization.storage.StorageJob;
 import com.aicivilization.profession.MinerJob;
+import com.aicivilization.profession.BuilderJob;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.ai.attributes.AttributeSupplier;
 import net.minecraft.world.entity.ai.attributes.Attributes;
@@ -93,6 +94,7 @@ public class CitizenEntity extends PathfinderMob {
     private boolean announcedBorderStop;
     private boolean storageEnabled;
     private boolean minerEnabled;
+    private boolean builderEnabled;
     private boolean professionResumeAnnounced;
     private int workStuckTicks;
     private int workStuckNoticeCooldown;
@@ -101,6 +103,7 @@ public class CitizenEntity extends PathfinderMob {
     private double workLastZ;
     private final StorageJob storageJob = new StorageJob();
     private final MinerJob minerJob = new MinerJob();
+    private final BuilderJob builderJob = new BuilderJob();
     private int toolLookupCooldown;
     private boolean toolPickupPending;
     private ServerPlayer lumberjackBreaker;
@@ -133,6 +136,9 @@ public class CitizenEntity extends PathfinderMob {
         } else if (minerEnabled) {
             stopMinerWork(false);
             announce("Cancelei a escavação. Agora vou seguir você.");
+        } else if (builderEnabled) {
+            stopBuilderWork(false);
+            announce("Cancelei a construção. Agora vou seguir você.");
         } else {
             announce("Estou seguindo você.");
         }
@@ -164,6 +170,7 @@ public class CitizenEntity extends PathfinderMob {
         if (this.level().isClientSide() || nationId == null || !belongsToNation(target)) return false;
         stopLumberjackWork(false);
         stopMinerWork(false);
+        stopBuilderWork(false);
         followTarget = null;
         travelTarget = target.immutable();
         travelLocationName = locationName;
@@ -225,6 +232,7 @@ public class CitizenEntity extends PathfinderMob {
     }
 
     private String currentWorkStatus(ServerLevel level) {
+        if (builderEnabled) return builderJob.workStatus();
         if (storageEnabled) return storageJob.workStatus(this, level);
         if (minerEnabled) return minerJob.workStatus(this, level);
         if (lumberjackEnabled) {
@@ -270,6 +278,7 @@ public class CitizenEntity extends PathfinderMob {
         if (this.level().isClientSide()) return false;
         stopStorageWork(false);
         stopMinerWork(false);
+        stopBuilderWork(false);
         if (this.getCustomName() != null) {
             String current = this.getCustomName().getString();
             int marker = current.indexOf(" - [");
@@ -324,6 +333,7 @@ public class CitizenEntity extends PathfinderMob {
         }
         stopLumberjackWork(false);
         stopMinerWork(false);
+        stopBuilderWork(false);
         followTarget = null;
         travelTarget = null;
         this.getNavigation().stop();
@@ -343,12 +353,14 @@ public class CitizenEntity extends PathfinderMob {
         stopLumberjackWork(true);
         stopStorageWork(true);
         stopMinerWork(true);
+        stopBuilderWork(true);
     }
 
     public boolean startMiner() {
         if (this.level().isClientSide() || nationId == null || !(this.level() instanceof ServerLevel level)) return false;
         stopLumberjackWork(false);
         stopStorageWork(false);
+        stopBuilderWork(false);
         followTarget = null;
         travelTarget = null;
         getNavigation().stop();
@@ -358,6 +370,34 @@ public class CitizenEntity extends PathfinderMob {
         refreshDisplayName();
         minerJob.start(this, level);
         return true;
+    }
+
+    public boolean startBuilder() {
+        if (this.level().isClientSide() || nationId == null || !(this.level() instanceof ServerLevel level)) return false;
+        stopLumberjackWork(false);
+        stopStorageWork(false);
+        stopMinerWork(false);
+        followTarget = null;
+        travelTarget = null;
+        getNavigation().stop();
+        builderEnabled = true;
+        CivilizationData.Nation nation = CivilizationData.get(level).getNation(nationId);
+        if (nation != null) builderJob.start(this, nation.center());
+        professionLabel = "Builder";
+        professionResumeAnnounced = true;
+        refreshDisplayName();
+        announce("Vou preparar o terreno da warehouse quando o Storager solicitar e abrir os caminhos da vila.");
+        return true;
+    }
+
+    private void stopBuilderWork(boolean shouldAnnounce) {
+        if (!builderEnabled) return;
+        builderEnabled = false;
+        builderJob.stop();
+        getNavigation().stop();
+        professionLabel = "Citizen";
+        refreshDisplayName();
+        if (shouldAnnounce) announce("Parei o trabalho de construção.");
     }
 
     public void stopMiner() {
@@ -418,6 +458,8 @@ public class CitizenEntity extends PathfinderMob {
             jobState = storageJob.debugStatus(this, level);
         } else if (minerEnabled) {
             jobState = minerJob.debugStatus(this, level);
+        } else if (builderEnabled) {
+            jobState = builderJob.debugStatus();
         } else if (lumberjackEnabled) {
             String target = lumberjackTarget == null ? "none" : lumberjackTarget.toShortString()
                 + "/" + BuiltInRegistries.BLOCK.getKey(level.getBlockState(lumberjackTarget).getBlock());
@@ -489,6 +531,15 @@ public class CitizenEntity extends PathfinderMob {
             minerJob.tick(this, level);
             return;
         }
+        if (builderEnabled) {
+            announceResumedProfession("Retomei o trabalho de construção.");
+            if (!builderJob.isInitialized()) {
+                CivilizationData.Nation nation = CivilizationData.get(level).getNation(nationId);
+                if (nation != null) builderJob.start(this, nation.center());
+            }
+            builderJob.tick(this, level);
+            return;
+        }
         if (!lumberjackEnabled) return;
         announceResumedProfession("Retomei o trabalho de lenhador.");
         if (lumberjackCooldown-- > 0) return;
@@ -504,7 +555,9 @@ public class CitizenEntity extends PathfinderMob {
         tag.putBoolean("LumberjackEnabled", lumberjackEnabled);
         tag.putBoolean("StorageEnabled", storageEnabled);
         tag.putBoolean("MinerEnabled", minerEnabled);
+        tag.putBoolean("BuilderEnabled", builderEnabled);
         minerJob.save(tag);
+        builderJob.save(tag);
         if (nationId != null) tag.store("NationId", UUIDUtil.CODEC, nationId);
         tag.putString("NationName", nationName);
         if (lastPositionInsideNation != null) tag.store("LastPositionInsideNation", BlockPos.CODEC, lastPositionInsideNation);
@@ -524,10 +577,19 @@ public class CitizenEntity extends PathfinderMob {
         professionLabel = storageEnabled ? "Storager" : lumberjackEnabled ? "LumberJack"
             : tag.getStringOr("ProfessionLabel", "Citizen");
         minerEnabled = tag.getBooleanOr("MinerEnabled", false);
+        builderEnabled = tag.getBooleanOr("BuilderEnabled", false);
+        builderJob.load(tag);
         if (minerEnabled) {
             lumberjackEnabled = false;
             storageEnabled = false;
+            builderEnabled = false;
             professionLabel = "Miner";
+        }
+        if (builderEnabled) {
+            lumberjackEnabled = false;
+            storageEnabled = false;
+            minerEnabled = false;
+            professionLabel = "Builder";
         }
         minerJob.load(tag);
         nationId = tag.read("NationId", UUIDUtil.CODEC).orElse(null);
@@ -1240,7 +1302,7 @@ public class CitizenEntity extends PathfinderMob {
     }
 
     private boolean hasActiveProfession() {
-        return lumberjackEnabled || minerEnabled || storageEnabled;
+        return lumberjackEnabled || minerEnabled || storageEnabled || builderEnabled;
     }
 
     private boolean workNavigationExpected(ServerLevel level) {
@@ -1249,8 +1311,13 @@ public class CitizenEntity extends PathfinderMob {
             return warehouse != null && distanceToSqr(warehouse.x() + 0.5, warehouse.y(), warehouse.z() + 0.5) > 196.0;
         }
         if (minerEnabled) return minerJob.needsNavigation(this, level);
+        if (builderEnabled) return builderJob.isActive() && !getNavigation().isDone();
         return lumberjackEnabled && lumberjackTarget != null
             && distanceToSqr(lumberjackTarget.getX() + 0.5, getY(), lumberjackTarget.getZ() + 0.5) > 9.0;
+    }
+
+    public boolean isInsideNation(BlockPos position) {
+        return belongsToNation(position);
     }
 
     public static AttributeSupplier.Builder createAttributes() {
