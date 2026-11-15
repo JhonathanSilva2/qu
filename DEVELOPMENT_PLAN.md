@@ -13,9 +13,9 @@ O repositório antigo é um bot Mineflayer para Minecraft 1.20.6, conectado ao s
 ### Conceitos que vamos reaproveitar
 
 - [x] Identidade de companion com modelo/equipamento próprios, inspirada no padrão do AI-Buddies, sem transformar a entidade em um jogador real.
-- [ ] Extrair a profissão atual de `CitizenEntity.tick()` para uma tarefa com estados explícitos, alvo e transições controladas.
+- [x] Extrair a profissão atual de `CitizenEntity.tick()` para uma tarefa com estados explícitos, alvo e transições controladas.
 - [ ] Escolher ferramentas pelo bloco-alvo, medir progresso de quebra e interromper/retomar quando o alvo deixar de ser válido.
-- [ ] Tratar árvore como conjunto conectado de troncos, em vez de cortar somente uma coluna vertical.
+- [x] Tratar árvore como conjunto conectado de troncos, em vez de cortar somente uma coluna vertical.
 - [ ] Usar quota/inventário cheio como gatilho futuro para depósito no baú.
 - [ ] Manter recuperação de caminho isolada da lógica de profissão; evitar apagar listeners globais ao instalar anti-stuck.
 
@@ -169,6 +169,20 @@ O repositório antigo é um bot Mineflayer para Minecraft 1.20.6, conectado ao s
 - [ ] Atualizar `/aiciv help` à medida que novos comandos forem adicionados.
 - [ ] Documentar os comandos e limitações confirmadas no jogo.
 
+### 5. Backlog de Funcionalidades e Ideias (Detalhes em `docs/ideas.md`)
+
+- [ ] **Visualização de Limites da Nação:** Exibição clara de bordas/fronteiras (partículas de contorno circular/raio da nação, feedback no chat/ActionBar ou marcos físicos).
+- [ ] **Skins Dedicadas por Profissão:** Vincular as texturas em `textures/entity/` (`builder.png`, `farmer.png`, `explorer.png`, `fisherman.png`, `hunter.png`, `guard.png`, `lumberjack.png`, `miner.png`, `storager.png`) no `CitizenEntityRenderer`.
+- [ ] **Mural de Necessidades de Recursos:** Placas ou quadro de avisos dinâmico no armazém/centro indicando o que a nação precisa no momento (com interação para o jogador entregar itens).
+- [ ] **Novas Profissões:**
+  - [ ] Construtor (`builder`): Reparos, construções baseadas em blueprints, cercamento e pavimentação.
+  - [ ] Fazendeiro (`farmer`): Plantações e criação de animais.
+  - [ ] Explorador (`explorer`): Mapeamento, busca de biomas e cavernas.
+  - [ ] Pescador (`fisherman`): Pesca e abastecimento de peixes/alimentos aquáticos.
+  - [ ] Caçador (`hunter`): Caça de animais para carne, couro e penas.
+  - [ ] Guarda (`guard`): Patrulha e proteção armada contra monstros.
+
+
 ## Registro de testes
 
 | Data | Minecraft/loader | Ação ou comando | Resultado observado | Próximo ajuste |
@@ -178,6 +192,7 @@ O repositório antigo é um bot Mineflayer para Minecraft 1.20.6, conectado ao s
 | 2026-11-14 | 1.21.10 / Fabric Loader 0.18.0 | `compileJava` e `compileClientJava` após profissão Miner, seleção de tiers de picareta, retorno por veio e pack de pedregulho | `BUILD SUCCESSFUL` com Fabric Loom 1.19.4. Ainda não foi testado dentro do jogo. | Executar os novos cenários no Minecraft. |
 | 2026-11-14 | 1.21.10 / Fabric Loader 0.18.0 | `compileJava` e `compileClientJava` após corrigir atributo de movimento e retomada de profissões | `BUILD SUCCESSFUL` com Fabric Loom 1.19.4. Ainda falta confirmar movimento e retomada no jogo. | Entrar no mundo salvo e verificar caminhada do Storager, Miner e lenhador. |
 | 2026-11-14 | 1.21.10 / Fabric Loader 0.18.0 | `remapJar` após diagnóstico de NPCs parados | `BUILD SUCCESSFUL`; JAR atualizado copiado para a pasta global `.minecraft/mods`. O log anterior confirmou que Miner retomou a profissão, mas aguardava picareta; a pasta do launcher estava sem o JAR do mod. | Reiniciar o TLauncher para carregar a nova build e observar Storager, Miner e lenhador. |
+| 2026-11-14 | 1.21.10 / Fabric Loader 0.18.0 | `build` após refatoração modular (`ProfessionJob`, `LumberjackJob`), correção de bugs (loop da mina, comandos `go`/`nation`, watchdog teleporte, banner substituível, flood no chat) | `BUILD SUCCESSFUL` gerando `ai-civilization-0.1.0.jar` (copiado para `~/.minecraft/mods`). | Testar novos comandos e comportamento modular no mundo. |
 
 ## Regras de trabalho
 

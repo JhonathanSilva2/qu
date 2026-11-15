@@ -33,7 +33,10 @@ import java.util.Set;
 import java.util.concurrent.ThreadLocalRandom;
 
 /** Autonomous seven-wide descending mine with water sealing and lava avoidance. */
-public final class MinerJob {
+public final class MinerJob implements ProfessionJob {
+    public static final String ID = "miner";
+    public static final String LABEL = "Miner";
+
     private static final int WIDTH = 7;
     private static final int MAX_DEPTH = 72;
     private static final List<Item> PICKAXES = List.of(
@@ -64,7 +67,18 @@ public final class MinerJob {
     private boolean oreDeliveryPending;
     private final List<BlockPos> pendingWaterSources = new ArrayList<>();
 
-    public void start(CitizenEntity citizen, ServerLevel level) {
+    @Override
+    public String getId() {
+        return ID;
+    }
+
+    @Override
+    public String getLabel() {
+        return LABEL;
+    }
+
+    @Override
+    public boolean start(CitizenEntity citizen, ServerLevel level) {
         chooseMineSite(citizen, level);
         step = 0;
         blockCursor = 0;
@@ -75,6 +89,15 @@ public final class MinerJob {
         oreDeliveryPending = false;
         pendingWaterSources.clear();
         citizen.announce(random(START_PHRASES));
+        return true;
+    }
+
+    @Override
+    public void stop(CitizenEntity citizen, ServerLevel level, boolean announce) {
+        citizen.getNavigation().stop();
+        if (announce) {
+            citizen.announce("Parei a escavação.");
+        }
     }
 
     public void save(ValueOutput output) {
@@ -222,7 +245,7 @@ public final class MinerJob {
         if (mineOrigin == null) chooseMineSite(citizen, level);
         if (mineOrigin == null) return;
 
-        if (insideNation(citizen, level, mineOrigin)
+        if (step == 0 && insideNation(citizen, level, mineOrigin)
             && citizen.distanceToSqr(mineOrigin.getX() + 0.5, mineOrigin.getY(), mineOrigin.getZ() + 0.5) > 16.0) {
             if (citizen.getNavigation().isDone())
                 citizen.getNavigation().moveTo(mineOrigin.getX() + 0.5, mineOrigin.getY(), mineOrigin.getZ() + 0.5, 0.9);
