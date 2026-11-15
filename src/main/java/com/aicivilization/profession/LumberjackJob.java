@@ -661,9 +661,13 @@ public final class LumberjackJob implements ProfessionJob {
 
     private void replantAvailableSaplings(CitizenEntity citizen, ServerLevel level) {
         if (pendingReplantPositions.isEmpty()) return;
+        CivilizationData.Nation nation = citizen.getNationId() == null
+            ? null : CivilizationData.get(level).getNation(citizen.getNationId());
         for (int i = 0; i < pendingReplantPositions.size(); i++) {
             BlockPos pos = pendingReplantPositions.get(i);
-            if (!citizen.belongsToNation(pos) || isInsideExcludedPlantingArea(citizen, pos, level)) {
+            if (!citizen.belongsToNation(pos) || nation == null
+                || !isInsideReforestationZone(nation, pos)
+                || isInsideExcludedPlantingArea(citizen, pos, level)) {
                 pendingReplantPositions.remove(i--);
                 continue;
             }

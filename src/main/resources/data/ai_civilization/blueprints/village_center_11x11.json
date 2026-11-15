@@ -1,0 +1,21 @@
+{
+  "width": 11,
+  "depth": 11,
+  "legend": {
+    "P": "minecraft:oak_planks",
+    "S": "nation_standard"
+  },
+  "layout": [
+    "PPPPPPPPPPP",
+    "PPPPPPPPPPP",
+    "PPPPPPPPPPP",
+    "PPPPPPPPPPP",
+    "PPPPPPPPPPP",
+    "PPPPPSPPPPP",
+    "PPPPPPPPPPP",
+    "PPPPPPPPPPP",
+    "PPPPPPPPPPP",
+    "PPPPPPPPPPP",
+    "PPPPPPPPPPP"
+  ]
+}
