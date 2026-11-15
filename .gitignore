@@ -1,4 +1,5 @@
 .gradle/
+.env
 .gradle-user-home/
 build/
 out/
