@@ -3,6 +3,7 @@ package com.aicivilization;
 import com.aicivilization.config.ModConfig;
 import com.aicivilization.entity.CitizenEntity;
 import com.aicivilization.entity.ModEntities;
+import com.aicivilization.profession.MinerJob;
 import com.aicivilization.storage.StorageJob;
 import com.aicivilization.data.CivilizationData;
 import com.aicivilization.util.ChatMessages;
@@ -10,9 +11,12 @@ import com.mojang.logging.LogUtils;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.minecraft.commands.Commands;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.core.particles.ParticleTypes;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.level.levelgen.Heightmap;
@@ -56,6 +60,7 @@ public class AICivilizationMod implements ModInitializer {
         "/aiciv storage queue — lista pedidos abertos de recursos e ferramentas",
         "/aiciv debug status <name|slot> — mostra posição, alvo e motivo provável de bloqueio",
         "/aiciv debug watch <name|slot> — acompanha o estado do cidadão a cada 2 segundos por 60 segundos",
+        "/aiciv debug range — exibe informações e partículas 3D dos limites da civilização e da mina",
         "/aiciv debug stop — encerra o rastreamento",
         "/aiciv location set <name> — salva sua posição como local",
         "/aiciv location remove <name> — remove um local salvo",
@@ -72,6 +77,7 @@ public class AICivilizationMod implements ModInitializer {
     );
     private static final Map<UUID, UUID> SELECTED_NPCS = new ConcurrentHashMap<>();
     private static final Map<UUID, DebugWatch> DEBUG_WATCHES = new ConcurrentHashMap<>();
+    private static final Map<UUID, DebugRangeWatch> DEBUG_RANGE_WATCHES = new ConcurrentHashMap<>();
     private static final List<String> BRAZILIAN_NAMES = List.of(
         "Gabriel", "Lucas", "Mateus", "João", "Pedro", "Rafael", "Arthur", "Davi",
         "Miguel", "Heitor", "Enzo", "Bernardo", "Thiago", "Gustavo", "Felipe", "Caio"
@@ -81,6 +87,7 @@ public class AICivilizationMod implements ModInitializer {
     public void onInitialize() {
         ModConfig.load();
         ModEntities.initialize();
+        ServerTickEvents.END_WORLD_TICK.register(AICivilizationMod::tickDebugRangeWatches);
         ServerLivingEntityEvents.AFTER_DEATH.register((entity, damageSource) -> {
             if (entity instanceof CitizenEntity citizen && entity.level() instanceof ServerLevel level) {
                 Component message = Component.literal(citizen.getDisplayNameText() + " morreu.")
@@ -181,8 +188,16 @@ public class AICivilizationMod implements ModInitializer {
                     .then(Commands.literal("watch")
                         .then(Commands.argument("npc", StringArgumentType.word())
                             .executes(context -> watchNpc(context.getSource().getPlayerOrException(), getString(context, "npc")))))
+                    .then(Commands.literal("range")
+                        .executes(context -> showRangeDebug(context.getSource().getPlayerOrException()))
+                        .then(Commands.literal("stop")
+                            .executes(context -> stopRangeDebug(context.getSource().getPlayerOrException()))))
                     .then(Commands.literal("stop")
-                        .executes(context -> stopDebugWatch(context.getSource().getPlayerOrException()))))
+                        .executes(context -> {
+                            int r1 = stopDebugWatch(context.getSource().getPlayerOrException());
+                            int r2 = stopRangeDebug(context.getSource().getPlayerOrException());
+                            return r1 + r2;
+                        })))
                 .then(Commands.literal("nation")
                     .executes(context -> showNearestNation(context.getSource().getPlayerOrException()))
                     .then(Commands.literal("size")
@@ -508,6 +523,170 @@ public class AICivilizationMod implements ModInitializer {
     }
 
     private record DebugWatch(UUID citizenId, long nextAt, long expiresAt) {}
+
+    private int showRangeDebug(ServerPlayer player) {
+        ServerLevel level = player.level();
+        CivilizationData data = CivilizationData.get(level);
+        CivilizationData.Nation nation = data.findNationAt(player.blockPosition(), level.dimension().location());
+        if (nation == null) {
+            CitizenEntity nearest = findNearestNpc(player);
+            if (nearest != null && nearest.getNationId() != null) {
+                nation = data.getNation(nearest.getNationId());
+            }
+        }
+        if (nation == null) {
+            player.sendSystemMessage(ChatMessages.error("Nenhuma civilização encontrada nesta dimensão próxima a você. Crie uma com /aiciv create civilization <nome>."));
+            return 0;
+        }
+
+        BlockPos center = nation.center();
+        int radius = CivilizationData.NATION_RADIUS_BLOCKS;
+        player.sendSystemMessage(ChatMessages.title("Limites da Civilização — " + nation.name()));
+        player.sendSystemMessage(ChatMessages.info("• Território: Centro [" + center.toShortString() + "] | Raio: " + radius + " blocos"));
+        player.sendSystemMessage(ChatMessages.info("  Limites: X de " + (center.getX() - radius) + " a " + (center.getX() + radius)
+            + " | Z de " + (center.getZ() - radius) + " a " + (center.getZ() + radius)));
+
+        CivilizationData.Warehouse warehouse = data.warehouse(nation.id());
+        if (warehouse != null && warehouse.dimension().equals(level.dimension().location())) {
+            player.sendSystemMessage(ChatMessages.info("• Armazém: Centro [" + warehouse.center().toShortString() + "] | Raio: " + warehouse.radius() + " blocos"));
+        } else {
+            player.sendSystemMessage(ChatMessages.info("• Armazém: Nenhum configurado ainda."));
+        }
+
+        List<CitizenEntity> citizens = getCitizens(player);
+        UUID targetNationId = nation.id();
+        CitizenEntity miner = citizens.stream()
+            .filter(c -> targetNationId.equals(c.getNationId()) && c.isMinerEnabled())
+            .findFirst().orElse(null);
+
+        if (miner != null && miner.getMinerJob() != null && miner.getMinerJob().getMineOrigin() != null) {
+            MinerJob job = miner.getMinerJob();
+            BlockPos origin = job.getMineOrigin();
+            BlockPos currentApproach = job.getCurrentApproach();
+            player.sendSystemMessage(ChatMessages.info("• Mina (" + miner.getPersonalName() + "): Entrada [" + origin.toShortString()
+                + "] (Y=" + origin.getY() + ", alinhada com a base: " + (origin.getY() == center.getY() ? "sim" : "não") + ")"));
+            player.sendSystemMessage(ChatMessages.info("  Direção: " + job.getDirection() + " | Largura: " + job.getWidth() + " | Altura: " + job.getHeight()
+                + " | Degrau: " + job.getStep() + "/72 | Frente: [" + (currentApproach == null ? "n/d" : currentApproach.toShortString()) + "]"));
+        } else {
+            player.sendSystemMessage(ChatMessages.info("• Mina: Nenhum minerador ativo com local definido na nação."));
+        }
+
+        long now = level.getGameTime();
+        DEBUG_RANGE_WATCHES.put(player.getUUID(), new DebugRangeWatch(nation.id(), now, now + 1200));
+        player.sendSystemMessage(ChatMessages.success("Partículas 3D dos limites ativadas por 60s! (Verde = Território, Chama = Entrada da Mina, Azul = Frente da Mina). Use /aiciv debug stop para encerrar."));
+        return 1;
+    }
+
+    private int stopRangeDebug(ServerPlayer player) {
+        DebugRangeWatch removed = DEBUG_RANGE_WATCHES.remove(player.getUUID());
+        if (removed == null) {
+            player.sendSystemMessage(ChatMessages.info("Você não tem visualização de limites (debug range) ativa."));
+            return 0;
+        }
+        player.sendSystemMessage(ChatMessages.success("Visualização de limites (debug range) encerrada."));
+        return 1;
+    }
+
+    public static void tickDebugRangeWatches(ServerLevel level) {
+        if (DEBUG_RANGE_WATCHES.isEmpty()) return;
+        long now = level.getGameTime();
+        CivilizationData data = CivilizationData.get(level);
+
+        for (Map.Entry<UUID, DebugRangeWatch> entry : DEBUG_RANGE_WATCHES.entrySet()) {
+            UUID playerId = entry.getKey();
+            DebugRangeWatch watch = entry.getValue();
+            ServerPlayer player = level.getServer().getPlayerList().getPlayer(playerId);
+            if (player == null || !player.level().dimension().equals(level.dimension())) {
+                DEBUG_RANGE_WATCHES.remove(playerId);
+                continue;
+            }
+            if (now >= watch.expiresAt()) {
+                DEBUG_RANGE_WATCHES.remove(playerId);
+                player.sendSystemMessage(ChatMessages.info("Visualização de limites (debug range) expirou."));
+                continue;
+            }
+            if (now < watch.nextAt()) continue;
+            DEBUG_RANGE_WATCHES.put(playerId, new DebugRangeWatch(watch.nationId(), now + 20, watch.expiresAt()));
+
+            CivilizationData.Nation nation = data.getNation(watch.nationId());
+            if (nation == null) continue;
+
+            int radius = CivilizationData.NATION_RADIUS_BLOCKS;
+            double pX = player.getX();
+            double pZ = player.getZ();
+
+            // 1. Círculo do território da nação (verde esmeralda)
+            for (int angle = 0; angle < 360; angle += 6) {
+                double rad = Math.toRadians(angle);
+                double x = nation.x() + radius * Math.cos(rad);
+                double z = nation.z() + radius * Math.sin(rad);
+                if ((x - pX) * (x - pX) + (z - pZ) * (z - pZ) > 96.0 * 96.0) continue;
+                int y = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, (int) x, (int) z);
+                level.sendParticles(player, ParticleTypes.HAPPY_VILLAGER, true, false, x + 0.5, y + 1.2, z + 0.5, 1, 0.0, 0.0, 0.0, 0.0);
+            }
+
+            // 2. Círculo do armazém (se houver)
+            CivilizationData.Warehouse warehouse = data.warehouse(nation.id());
+            if (warehouse != null && warehouse.dimension().equals(level.dimension().location())) {
+                for (int angle = 0; angle < 360; angle += 30) {
+                    double rad = Math.toRadians(angle);
+                    double wx = warehouse.x() + warehouse.radius() * Math.cos(rad);
+                    double wz = warehouse.z() + warehouse.radius() * Math.sin(rad);
+                    int wy = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, (int) wx, (int) wz);
+                    level.sendParticles(player, ParticleTypes.END_ROD, true, false, wx + 0.5, wy + 1.0, wz + 0.5, 1, 0.0, 0.0, 0.0, 0.0);
+                }
+            }
+
+            // 3. Mina (se houver minerador da nação)
+            List<CitizenEntity> citizens = level.getEntitiesOfClass(CitizenEntity.class, player.getBoundingBox().inflate(128.0));
+            for (CitizenEntity citizen : citizens) {
+                if (!nation.id().equals(citizen.getNationId()) || !citizen.isMinerEnabled()) continue;
+                MinerJob miner = citizen.getMinerJob();
+                if (miner == null || miner.getMineOrigin() == null) continue;
+                BlockPos origin = miner.getMineOrigin();
+                Direction dir = miner.getDirection();
+                Direction across = dir.getClockWise();
+                int width = miner.getWidth();
+                int height = miner.getHeight();
+                int step = miner.getStep();
+
+                // Entrada da mina (chamas)
+                for (int w = -width / 2; w <= width / 2; w++) {
+                    for (int h = 0; h < height; h++) {
+                        BlockPos p = origin.relative(across, w).above(h);
+                        level.sendParticles(player, ParticleTypes.FLAME, true, false,
+                            p.getX() + 0.5, p.getY() + 0.5, p.getZ() + 0.5, 1, 0.0, 0.0, 0.0, 0.0);
+                    }
+                }
+
+                // Linhas das paredes laterais descendo a escada
+                int stepInterval = Math.max(1, step / 10);
+                for (int s = 0; s <= step; s += stepInterval) {
+                    BlockPos centerSlice = origin.relative(dir, s).below(s);
+                    BlockPos leftEdge = centerSlice.relative(across, -width / 2);
+                    BlockPos rightEdge = centerSlice.relative(across, width / 2);
+                    level.sendParticles(player, ParticleTypes.FLAME, true, false,
+                        leftEdge.getX() + 0.5, leftEdge.getY() + 0.5, leftEdge.getZ() + 0.5, 1, 0.0, 0.0, 0.0, 0.0);
+                    level.sendParticles(player, ParticleTypes.FLAME, true, false,
+                        rightEdge.getX() + 0.5, rightEdge.getY() + 0.5, rightEdge.getZ() + 0.5, 1, 0.0, 0.0, 0.0, 0.0);
+                }
+
+                // Frente atual da escavação (chama azul)
+                BlockPos currentFront = miner.getCurrentApproach();
+                if (currentFront != null) {
+                    for (int w = -width / 2; w <= width / 2; w++) {
+                        for (int h = 0; h < height; h++) {
+                            BlockPos p = currentFront.relative(across, w).above(h);
+                            level.sendParticles(player, ParticleTypes.SOUL_FIRE_FLAME, true, false,
+                                p.getX() + 0.5, p.getY() + 0.5, p.getZ() + 0.5, 1, 0.0, 0.0, 0.0, 0.0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private record DebugRangeWatch(UUID nationId, long nextAt, long expiresAt) {}
 
     private int listNations(ServerPlayer player) {
         CivilizationData data = CivilizationData.get((ServerLevel) player.level());

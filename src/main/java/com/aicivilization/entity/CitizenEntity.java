@@ -129,6 +129,10 @@ public class CitizenEntity extends PathfinderMob {
         return activeJob == minerJob;
     }
 
+    public MinerJob getMinerJob() {
+        return minerJob;
+    }
+
     public boolean startLumberjack() {
         if (this.level().isClientSide() || !(this.level() instanceof ServerLevel level)) return false;
         return setJob(lumberjackJob, level);

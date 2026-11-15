@@ -38,6 +38,7 @@ public final class MinerJob implements ProfessionJob {
     public static final String LABEL = "Miner";
 
     private static final int WIDTH = 7;
+    private static final int HEIGHT = 3;
     private static final int MAX_DEPTH = 72;
     private static final List<Item> PICKAXES = List.of(
         Items.DIAMOND_PICKAXE, Items.IRON_PICKAXE, Items.STONE_PICKAXE, Items.WOODEN_PICKAXE
@@ -93,6 +94,10 @@ public final class MinerJob implements ProfessionJob {
 
         if (!isPickaxe(citizen.getMainHandItem()) && bestInventoryPickaxe(citizen) == null) {
             citizen.setItemSlot(EquipmentSlot.MAINHAND, new ItemStack(Items.WOODEN_PICKAXE));
+        }
+
+        if (!citizen.getNpcInventory().hasAnyMatching(stack -> stack.is(Items.TORCH))) {
+            citizen.getNpcInventory().addItem(new ItemStack(Items.TORCH, 16));
         }
 
         markMineEntrance(level, citizen);
@@ -276,6 +281,8 @@ public final class MinerJob implements ProfessionJob {
             if (step >= MAX_DEPTH || mineOrigin.getY() - step < level.getMinY() + 8) {
                 chooseMineSite(citizen, level);
                 step = 0;
+            } else {
+                placeTorchIfNeeded(citizen, level);
             }
             slice = currentSlice();
         }
@@ -345,6 +352,48 @@ public final class MinerJob implements ProfessionJob {
         }
     }
 
+    private void placeTorchIfNeeded(CitizenEntity citizen, ServerLevel level) {
+        if (mineOrigin == null || step <= 0 || step % 4 != 0) return;
+        BlockPos row = mineOrigin.relative(direction, step);
+        Direction across = direction.getClockWise();
+        int lateral = (step % 8 == 0) ? 2 : -2;
+        BlockPos floor = row.relative(across, lateral).below(step);
+        BlockPos torchPos = floor.above(1);
+
+        if (!level.getBlockState(torchPos).isAir() && !level.getBlockState(torchPos).canBeReplaced()) return;
+        if (!level.getBlockState(floor).isFaceSturdy(level, floor, Direction.UP)) {
+            level.setBlockAndUpdate(floor, Blocks.COBBLESTONE.defaultBlockState());
+        }
+
+        boolean hasTorch = false;
+        for (int slot = 0; slot < citizen.getNpcInventory().getContainerSize(); slot++) {
+            ItemStack stack = citizen.getNpcInventory().getItem(slot);
+            if (stack.is(Items.TORCH) && stack.getCount() > 0) {
+                stack.shrink(1);
+                if (stack.isEmpty()) citizen.getNpcInventory().setItem(slot, ItemStack.EMPTY);
+                hasTorch = true;
+                break;
+            }
+        }
+
+        if (!hasTorch) {
+            boolean hasCoal = citizen.getNpcInventory().hasAnyMatching(s -> s.is(Items.COAL) || s.is(Items.CHARCOAL));
+            boolean hasStick = citizen.getNpcInventory().hasAnyMatching(s -> s.is(Items.STICK));
+            if (hasCoal && hasStick) {
+                citizen.getNpcInventory().removeItemType(Items.STICK, 1);
+                Item coalItem = citizen.getNpcInventory().hasAnyMatching(s -> s.is(Items.COAL)) ? Items.COAL : Items.CHARCOAL;
+                citizen.getNpcInventory().removeItemType(coalItem, 1);
+                citizen.getNpcInventory().addItem(new ItemStack(Items.TORCH, 3));
+                hasTorch = true;
+            }
+        }
+
+        if (hasTorch) {
+            level.setBlockAndUpdate(torchPos, Blocks.TORCH.defaultBlockState());
+            announceThrottled(citizen, List.of("Coloquei uma tocha para iluminar a mina e evitar monstros."));
+        }
+    }
+
     private void markMineEntrance(ServerLevel level, CitizenEntity citizen) {
         if (mineOrigin == null) return;
         Direction across = direction.getClockWise();
@@ -376,41 +425,68 @@ public final class MinerJob implements ProfessionJob {
             entranceMarked = false;
             return;
         }
-        int[][] offsets = {{24, 0}, {-24, 0}, {0, 24}, {0, -24}, {24, 24}, {24, -24}, {-24, 24}, {-24, -24},
-            {32, 0}, {-32, 0}, {0, 32}, {0, -32}};
+        BlockPos base = basePosition(citizen, level);
+        int baseY = base.getY();
+
+        int[][] offsets = {
+            {24, 0}, {-24, 0}, {0, 24}, {0, -24},
+            {24, 24}, {24, -24}, {-24, 24}, {-24, -24},
+            {32, 0}, {-32, 0}, {0, 32}, {0, -32},
+            {20, 0}, {-20, 0}, {0, 20}, {0, -20},
+            {28, 0}, {-28, 0}, {0, 28}, {0, -28}
+        };
         CivilizationData.Warehouse warehouse = data.warehouse(nation.id());
+        BlockPos bestCandidate = null;
+        int bestDiff = Integer.MAX_VALUE;
+        Direction bestDirection = Direction.SOUTH;
+
         for (int[] offset : offsets) {
             int x = nation.x() + offset[0];
             int z = nation.z() + offset[1];
-            BlockPos probe = new BlockPos(x, nation.y(), z);
+            BlockPos probe = new BlockPos(x, baseY, z);
             if (!level.hasChunkAt(probe)) continue;
-            int y = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
-            BlockPos candidate = new BlockPos(x, y, z);
-            if (!nation.contains(candidate) || Math.abs(offset[0]) < 10 && Math.abs(offset[1]) < 10) continue;
+            int surfaceY = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
+            BlockPos candidate = new BlockPos(x, baseY, z);
+            if (!nation.contains(candidate) || (Math.abs(offset[0]) < 10 && Math.abs(offset[1]) < 10)) continue;
             if (warehouse != null && warehouse.center().distSqr(candidate) < (warehouse.radius() + 12.0) * (warehouse.radius() + 12.0)) continue;
-            if (!level.getBlockState(candidate).isAir() || !level.getBlockState(candidate.below()).isFaceSturdy(level, candidate.below(), Direction.UP)) continue;
-            mineOrigin = candidate;
-            direction = Math.abs(offset[0]) >= Math.abs(offset[1])
-                ? (offset[0] >= 0 ? Direction.EAST : Direction.WEST)
-                : (offset[1] >= 0 ? Direction.SOUTH : Direction.NORTH);
+
+            int diff = Math.abs(surfaceY - baseY);
+            if (diff < bestDiff) {
+                bestDiff = diff;
+                bestCandidate = candidate;
+                bestDirection = Math.abs(offset[0]) >= Math.abs(offset[1])
+                    ? (offset[0] >= 0 ? Direction.EAST : Direction.WEST)
+                    : (offset[1] >= 0 ? Direction.SOUTH : Direction.NORTH);
+                if (diff == 0) break;
+            }
+        }
+
+        if (bestCandidate != null) {
+            mineOrigin = bestCandidate;
+            direction = bestDirection;
             entranceMarked = false;
+            BlockPos below = mineOrigin.below();
+            if (!level.getBlockState(below).isFaceSturdy(level, below, Direction.UP)) {
+                level.setBlockAndUpdate(below, Blocks.COBBLESTONE.defaultBlockState());
+            }
             return;
         }
-        mineOrigin = citizen.blockPosition().immutable();
+
+        mineOrigin = new BlockPos(citizen.blockPosition().getX(), baseY, citizen.blockPosition().getZ());
         direction = Direction.SOUTH;
         entranceMarked = false;
     }
 
     private List<BlockPos> currentSlice() {
-        List<BlockPos> targets = new ArrayList<>(WIDTH * 2);
-        // Clear the two blocks above the next, lower floor while leaving that floor intact.
+        List<BlockPos> targets = new ArrayList<>(WIDTH * HEIGHT);
+        // Clear the HEIGHT blocks above the next, lower floor while leaving that floor intact.
         // The next approach point is one block forward and one block down.
         BlockPos row = mineOrigin.relative(direction, step + 1);
         Direction across = direction.getClockWise();
         for (int offset = 0; offset < WIDTH; offset++) {
             int lateral = offset - WIDTH / 2;
             BlockPos base = row.relative(across, lateral).below(step + 1);
-            for (int height = 1; height >= 0; height--) targets.add(base.above(height));
+            for (int height = HEIGHT - 1; height >= 0; height--) targets.add(base.above(height));
         }
         return targets;
     }
@@ -432,7 +508,7 @@ public final class MinerJob implements ProfessionJob {
         Direction across = heading.getClockWise();
         for (int width = -3; width <= 3; width++) {
             BlockPos column = origin.relative(across, width).relative(heading).below();
-            for (int height = 0; height <= 2; height++) {
+            for (int height = 0; height <= HEIGHT; height++) {
                 BlockPos pos = column.above(height);
                 if (level.getFluidState(pos).is(FluidTags.LAVA)) return false;
             }
@@ -440,11 +516,15 @@ public final class MinerJob implements ProfessionJob {
         return true;
     }
 
-    /** Opens the three-block staircase step used by AI Buddies: forward, headroom, then floor. */
+    /** Opens the staircase step: forward, headroom up to HEIGHT, then floor. */
     private boolean prepareStairStep(CitizenEntity citizen, ServerLevel level) {
         BlockPos current = citizen.blockPosition();
         BlockPos forward = current.relative(direction);
-        for (BlockPos candidate : List.of(forward, forward.above(), forward.below())) {
+        List<BlockPos> candidates = new ArrayList<>();
+        for (int h = HEIGHT - 1; h >= -1; h--) {
+            candidates.add(forward.above(h));
+        }
+        for (BlockPos candidate : candidates) {
             if (!insideNation(citizen, level, candidate)) return false;
             var fluid = level.getFluidState(candidate);
             if (fluid.is(FluidTags.LAVA)) return false;
@@ -619,5 +699,14 @@ public final class MinerJob implements ProfessionJob {
 
     private String random(List<String> phrases) {
         return phrases.get(ThreadLocalRandom.current().nextInt(phrases.size()));
+    }
+
+    public BlockPos getMineOrigin() { return mineOrigin; }
+    public Direction getDirection() { return direction; }
+    public int getStep() { return step; }
+    public int getWidth() { return WIDTH; }
+    public int getHeight() { return HEIGHT; }
+    public BlockPos getCurrentApproach() {
+        return mineOrigin == null ? null : mineOrigin.relative(direction, step).below(step);
     }
 }
