@@ -509,6 +509,9 @@ public final class StorageJob implements ProfessionJob {
                     break;
                 }
             }
+            if (destination == null && inbox != null && canAccept(inbox, toolStack)) {
+                destination = inbox;
+            }
             if (destination == null) {
                 buildChest(citizen, level, warehouse, chestPositions, false);
                 return;

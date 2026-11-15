@@ -65,6 +65,7 @@ public final class MinerJob implements ProfessionJob {
     private int announcementCooldown;
     private boolean toolPickupPending;
     private boolean oreDeliveryPending;
+    private boolean entranceMarked;
     private final List<BlockPos> pendingWaterSources = new ArrayList<>();
 
     @Override
@@ -88,6 +89,15 @@ public final class MinerJob implements ProfessionJob {
         toolPickupPending = false;
         oreDeliveryPending = false;
         pendingWaterSources.clear();
+        entranceMarked = false;
+
+        if (!isPickaxe(citizen.getMainHandItem()) && bestInventoryPickaxe(citizen) == null) {
+            citizen.setItemSlot(EquipmentSlot.MAINHAND, new ItemStack(Items.WOODEN_PICKAXE));
+        }
+
+        markMineEntrance(level, citizen);
+        entranceMarked = true;
+
         citizen.announce(random(START_PHRASES));
         return true;
     }
@@ -107,6 +117,7 @@ public final class MinerJob implements ProfessionJob {
         output.putInt("MineBlockCursor", blockCursor);
         output.putInt("MineRequestedPickaxeTier", requestedPickaxeTier);
         output.putBoolean("MineOreDeliveryPending", oreDeliveryPending);
+        output.putBoolean("MineEntranceMarked", entranceMarked);
         output.store("PendingMineWater", BlockPos.CODEC.listOf(), List.copyOf(pendingWaterSources));
     }
 
@@ -117,6 +128,7 @@ public final class MinerJob implements ProfessionJob {
         blockCursor = Math.max(0, input.getIntOr("MineBlockCursor", 0));
         requestedPickaxeTier = Math.max(0, input.getIntOr("MineRequestedPickaxeTier", 0));
         oreDeliveryPending = input.getBooleanOr("MineOreDeliveryPending", false);
+        entranceMarked = input.getBooleanOr("MineEntranceMarked", false);
         pendingWaterSources.clear();
         input.read("PendingMineWater", BlockPos.CODEC.listOf()).ifPresent(pendingWaterSources::addAll);
     }
@@ -245,6 +257,11 @@ public final class MinerJob implements ProfessionJob {
         if (mineOrigin == null) chooseMineSite(citizen, level);
         if (mineOrigin == null) return;
 
+        if (!entranceMarked) {
+            markMineEntrance(level, citizen);
+            entranceMarked = true;
+        }
+
         if (step == 0 && insideNation(citizen, level, mineOrigin)
             && citizen.distanceToSqr(mineOrigin.getX() + 0.5, mineOrigin.getY(), mineOrigin.getZ() + 0.5) > 16.0) {
             if (citizen.getNavigation().isDone())
@@ -296,9 +313,13 @@ public final class MinerJob implements ProfessionJob {
             return;
         }
         if (isOre(state) && pickaxeTier(citizen.getMainHandItem()) < requiredPickaxeTier(state)) {
-            requestedPickaxeTier = requiredPickaxeTier(state);
-            toolPickupPending = true;
-            ensurePickaxe(citizen, level, requiredPickaxeTier(state));
+            int neededTier = requiredPickaxeTier(state);
+            CivilizationData.get(level).requestStorageItem(citizen.getNationId(), citizen.getUUID(),
+                StorageJob.pickaxeRequestId(neededTier), 1);
+            announceThrottled(citizen, List.of(
+                "Encontrei " + state.getBlock().getName().getString() + " que exige picareta melhor; deixei marcado e continuei escavando a mina."
+            ));
+            blockCursor++;
             return;
         }
         if (isOre(state)) {
@@ -324,11 +345,35 @@ public final class MinerJob implements ProfessionJob {
         }
     }
 
+    private void markMineEntrance(ServerLevel level, CitizenEntity citizen) {
+        if (mineOrigin == null) return;
+        Direction across = direction.getClockWise();
+        boolean placedAny = false;
+        for (int side : List.of(-4, 4)) {
+            BlockPos lateral = mineOrigin.relative(across, side);
+            int surfaceY = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, lateral.getX(), lateral.getZ());
+            BlockPos ground = new BlockPos(lateral.getX(), surfaceY - 1, lateral.getZ());
+            BlockPos bannerPos = new BlockPos(lateral.getX(), surfaceY, lateral.getZ());
+            if (!level.getBlockState(ground).isFaceSturdy(level, ground, Direction.UP)) {
+                level.setBlockAndUpdate(ground, Blocks.COBBLESTONE.defaultBlockState());
+            }
+            if (level.getBlockState(bannerPos).isAir() || level.getBlockState(bannerPos).canBeReplaced()) {
+                if (level.setBlockAndUpdate(bannerPos, Blocks.GRAY_BANNER.defaultBlockState())) {
+                    placedAny = true;
+                }
+            }
+        }
+        if (placedAny) {
+            citizen.announce("Marquei a entrada da mina com um estandarte.");
+        }
+    }
+
     private void chooseMineSite(CitizenEntity citizen, ServerLevel level) {
         CivilizationData data = CivilizationData.get(level);
         CivilizationData.Nation nation = data.getNation(citizen.getNationId());
         if (nation == null) {
             mineOrigin = citizen.blockPosition().immutable();
+            entranceMarked = false;
             return;
         }
         int[][] offsets = {{24, 0}, {-24, 0}, {0, 24}, {0, -24}, {24, 24}, {24, -24}, {-24, 24}, {-24, -24},
@@ -348,10 +393,12 @@ public final class MinerJob implements ProfessionJob {
             direction = Math.abs(offset[0]) >= Math.abs(offset[1])
                 ? (offset[0] >= 0 ? Direction.EAST : Direction.WEST)
                 : (offset[1] >= 0 ? Direction.SOUTH : Direction.NORTH);
+            entranceMarked = false;
             return;
         }
         mineOrigin = citizen.blockPosition().immutable();
         direction = Direction.SOUTH;
+        entranceMarked = false;
     }
 
     private List<BlockPos> currentSlice() {
@@ -519,7 +566,8 @@ public final class MinerJob implements ProfessionJob {
         String path = BuiltInRegistries.ITEM.getKey(item).getPath();
         return path.startsWith("raw_") || path.equals("coal") || path.equals("diamond")
             || path.equals("emerald") || path.equals("redstone") || path.equals("lapis_lazuli")
-            || path.equals("quartz") || path.equals("ancient_debris") || path.equals("netherite_scrap");
+            || path.equals("quartz") || path.equals("ancient_debris") || path.equals("netherite_scrap")
+            || path.equals("raw_copper") || path.equals("copper_ingot") || path.equals("iron_ingot") || path.equals("gold_ingot");
     }
 
     private int pickaxeTier(ItemStack stack) {
