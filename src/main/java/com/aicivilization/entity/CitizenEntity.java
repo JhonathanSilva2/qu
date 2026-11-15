@@ -33,6 +33,10 @@ import net.minecraft.world.level.pathfinder.PathType;
 import net.minecraft.world.level.storage.ValueInput;
 import net.minecraft.world.level.storage.ValueOutput;
 
+import net.minecraft.network.syncher.EntityDataAccessor;
+import net.minecraft.network.syncher.EntityDataSerializers;
+import net.minecraft.network.syncher.SynchedEntityData;
+
 import java.util.EnumSet;
 import java.util.UUID;
 
@@ -41,6 +45,9 @@ import java.util.UUID;
  * Jobs and professions are fully modularized under com.aicivilization.profession.
  */
 public class CitizenEntity extends PathfinderMob {
+    private static final EntityDataAccessor<String> DATA_PROFESSION =
+        SynchedEntityData.defineId(CitizenEntity.class, EntityDataSerializers.STRING);
+
     private final SimpleContainer npcInventory = new SimpleContainer(27);
 
     // Modular jobs
@@ -75,6 +82,16 @@ public class CitizenEntity extends PathfinderMob {
         this.setPathfindingMalus(PathType.WATER_BORDER, 0.0f);
         this.goalSelector.addGoal(0, new FloatGoal(this));
         this.goalSelector.addGoal(2, new FollowPlayerGoal());
+    }
+
+    @Override
+    protected void defineSynchedData(SynchedEntityData.Builder builder) {
+        super.defineSynchedData(builder);
+        builder.define(DATA_PROFESSION, "");
+    }
+
+    public String getProfessionId() {
+        return this.entityData.get(DATA_PROFESSION);
     }
 
     public void follow(Player player) {
@@ -194,12 +211,14 @@ public class CitizenEntity extends PathfinderMob {
         if (!job.start(this, level)) {
             activeJob = null;
             professionLabel = "Citizen";
+            this.entityData.set(DATA_PROFESSION, "");
             refreshDisplayName();
             return false;
         }
         activeJob = job;
         professionLabel = job.getLabel();
         professionResumeAnnounced = true;
+        this.entityData.set(DATA_PROFESSION, job.getId());
         refreshDisplayName();
         return true;
     }
@@ -209,6 +228,7 @@ public class CitizenEntity extends PathfinderMob {
             activeJob.stop(this, level, announce);
             activeJob = null;
             professionLabel = "Citizen";
+            this.entityData.set(DATA_PROFESSION, "");
             refreshDisplayName();
         }
     }
@@ -428,6 +448,7 @@ public class CitizenEntity extends PathfinderMob {
             activeJob = null;
             professionLabel = tag.getStringOr("ProfessionLabel", "Citizen");
         }
+        this.entityData.set(DATA_PROFESSION, activeJob != null ? activeJob.getId() : "");
 
         nationId = tag.read("NationId", UUIDUtil.CODEC).orElse(null);
         nationName = tag.getStringOr("NationName", "");

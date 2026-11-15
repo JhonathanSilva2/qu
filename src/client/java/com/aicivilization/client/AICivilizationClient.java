@@ -14,10 +14,47 @@ import net.minecraft.resources.ResourceLocation;
 public class AICivilizationClient implements ClientModInitializer {
     private static final ResourceLocation CITIZEN_TEXTURE =
         ResourceLocation.fromNamespaceAndPath("ai_civilization", "textures/entity/citizen.png");
+    private static final ResourceLocation MINER_TEXTURE =
+        ResourceLocation.fromNamespaceAndPath("ai_civilization", "textures/entity/miner.png");
+    private static final ResourceLocation LUMBERJACK_TEXTURE =
+        ResourceLocation.fromNamespaceAndPath("ai_civilization", "textures/entity/lumberjack.png");
+    private static final ResourceLocation STORAGER_TEXTURE =
+        ResourceLocation.fromNamespaceAndPath("ai_civilization", "textures/entity/storager.png");
+    private static final ResourceLocation BUILDER_TEXTURE =
+        ResourceLocation.fromNamespaceAndPath("ai_civilization", "textures/entity/builder.png");
+    private static final ResourceLocation FARMER_TEXTURE =
+        ResourceLocation.fromNamespaceAndPath("ai_civilization", "textures/entity/farmer.png");
+    private static final ResourceLocation FISHERMAN_TEXTURE =
+        ResourceLocation.fromNamespaceAndPath("ai_civilization", "textures/entity/fisherman.png");
+    private static final ResourceLocation EXPLORER_TEXTURE =
+        ResourceLocation.fromNamespaceAndPath("ai_civilization", "textures/entity/explorer.png");
+    private static final ResourceLocation GUARD_TEXTURE =
+        ResourceLocation.fromNamespaceAndPath("ai_civilization", "textures/entity/guard.png");
+    private static final ResourceLocation HUNTER_TEXTURE =
+        ResourceLocation.fromNamespaceAndPath("ai_civilization", "textures/entity/hunter.png");
 
     @Override
     public void onInitializeClient() {
         EntityRenderers.register(ModEntities.CITIZEN, CitizenRenderer::new);
+    }
+
+    private static final java.util.Map<Integer, ResourceLocation> ENTITY_TEXTURES =
+        new java.util.concurrent.ConcurrentHashMap<>();
+
+    private static ResourceLocation getTextureForProfession(String professionId) {
+        if (professionId == null) return CITIZEN_TEXTURE;
+        return switch (professionId.toLowerCase()) {
+            case "miner" -> MINER_TEXTURE;
+            case "lumberjack" -> LUMBERJACK_TEXTURE;
+            case "storage", "storager" -> STORAGER_TEXTURE;
+            case "builder" -> BUILDER_TEXTURE;
+            case "farmer" -> FARMER_TEXTURE;
+            case "fisherman" -> FISHERMAN_TEXTURE;
+            case "explorer" -> EXPLORER_TEXTURE;
+            case "guard" -> GUARD_TEXTURE;
+            case "hunter" -> HUNTER_TEXTURE;
+            default -> CITIZEN_TEXTURE;
+        };
     }
 
     private static final class CitizenRenderer extends HumanoidMobRenderer<CitizenEntity, AvatarRenderState, PlayerModel> {
@@ -39,11 +76,13 @@ public class AICivilizationClient implements ClientModInitializer {
             state.showRightPants = true;
             state.showLeftSleeve = true;
             state.showRightSleeve = true;
+            ENTITY_TEXTURES.put(citizen.getId(), getTextureForProfession(citizen.getProfessionId()));
         }
 
         @Override
         public ResourceLocation getTextureLocation(AvatarRenderState state) {
-            return CITIZEN_TEXTURE;
+            ResourceLocation tex = ENTITY_TEXTURES.get(state.id);
+            return tex != null ? tex : CITIZEN_TEXTURE;
         }
     }
 }
