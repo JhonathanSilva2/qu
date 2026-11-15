@@ -28,8 +28,14 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.UUID;
 
+import com.aicivilization.profession.ProfessionJob;
+import net.minecraft.world.level.storage.ValueInput;
+import net.minecraft.world.level.storage.ValueOutput;
+
 /** Nation warehouse building, inbound pack handling, sorting, and tool requests. */
-public final class StorageJob {
+public final class StorageJob implements ProfessionJob {
+    public static final String ID = "storage";
+    public static final String LABEL = "Storager";
     public static final String BEST_AXE_REQUEST_ID = "ai_civilization:best_axe";
     public static final String BEST_PICKAXE_REQUEST_ID = "ai_civilization:best_pickaxe";
     private static final int DEFAULT_WAREHOUSE_RADIUS = 12;
@@ -50,9 +56,66 @@ public final class StorageJob {
     private int cooldown;
     private int lastMissingPlanksNotice = -1000;
     private int lastMissingAxeMaterialsNotice = -1000;
+    private int lastClearingNoticeTick = -1000;
     private int decorationIndex;
     private boolean decoratingFence;
     private boolean levelingNoticeSent;
+
+    @Override
+    public String getId() {
+        return ID;
+    }
+
+    @Override
+    public String getLabel() {
+        return LABEL;
+    }
+
+    @Override
+    public boolean start(CitizenEntity citizen, ServerLevel level) {
+        if (citizen.getNationId() == null) return false;
+        CivilizationData data = CivilizationData.get(level);
+        if (!data.claimStorager(citizen.getNationId(), citizen.getUUID())) {
+            citizen.announce("Esta nação já tem um Storager. Só pode haver um por cidade.");
+            return false;
+        }
+        if (!ensureWarehouseLocation(citizen, level)) {
+            data.releaseStorager(citizen.getNationId(), citizen.getUUID());
+            citizen.announce("Não encontrei um local seguro para o armazém fora da área central do estandarte.");
+            return false;
+        }
+        citizen.announce("Vou organizar o armazém da minha nação.");
+        return true;
+    }
+
+    @Override
+    public void stop(CitizenEntity citizen, ServerLevel level, boolean announce) {
+        if (citizen.getNationId() != null) {
+            CivilizationData.get(level).releaseStorager(citizen.getNationId(), citizen.getUUID());
+        }
+        citizen.getNavigation().stop();
+        if (announce) {
+            citizen.announce("Parei de organizar o armazém.");
+        }
+    }
+
+    @Override
+    public boolean needsNavigation(CitizenEntity citizen, ServerLevel level) {
+        CivilizationData.Warehouse warehouse = CivilizationData.get(level).warehouse(citizen.getNationId());
+        return warehouse != null && citizen.distanceToSqr(warehouse.x() + 0.5, warehouse.y(), warehouse.z() + 0.5) > 196.0;
+    }
+
+    @Override
+    public void save(ValueOutput output) {
+        output.putInt("StorageDecorationIndex", decorationIndex);
+        output.putBoolean("StorageDecoratingFence", decoratingFence);
+    }
+
+    @Override
+    public void load(ValueInput input) {
+        decorationIndex = input.getIntOr("StorageDecorationIndex", 0);
+        decoratingFence = input.getBooleanOr("StorageDecoratingFence", false);
+    }
 
     public static boolean ensureWarehouseLocation(CitizenEntity citizen, ServerLevel level) {
         CivilizationData data = CivilizationData.get(level);
@@ -821,9 +884,12 @@ public final class StorageJob {
                     } else {
                         level.destroyBlock(obstruction, false, citizen);
                     }
-                    citizen.announce(state.is(BlockTags.LEAVES)
-                        ? "Estou limpando as folhas da área planejada do armazém."
-                        : "Estou removendo uma árvore que ocupa a área do armazém.");
+                    if (citizen.tickCount - lastClearingNoticeTick >= 200) {
+                        citizen.announce(state.is(BlockTags.LEAVES)
+                            ? "Estou limpando as folhas da área planejada do armazém."
+                            : "Estou removendo uma árvore que ocupa a área do armazém.");
+                        lastClearingNoticeTick = citizen.tickCount;
+                    }
                     return true;
                 }
             }

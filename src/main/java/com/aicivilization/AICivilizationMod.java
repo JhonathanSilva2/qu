@@ -113,6 +113,10 @@ public class AICivilizationMod implements ModInitializer {
                 .then(Commands.literal("npc")
                     .executes(context -> spawnNpc(context.getSource().getPlayerOrException()))
                     .then(Commands.argument("npc", StringArgumentType.word())
+                        .then(Commands.literal("go")
+                            .then(Commands.argument("location", StringArgumentType.word())
+                                .executes(context -> sendNpcToLocation(context.getSource().getPlayerOrException(),
+                                    getString(context, "npc"), getString(context, "location")))))
                         .then(Commands.argument("job", StringArgumentType.word())
                             .executes(context -> assignJob(context.getSource().getPlayerOrException(),
                                 getString(context, "npc"), getString(context, "job")))))
@@ -145,8 +149,8 @@ public class AICivilizationMod implements ModInitializer {
                             .executes(context -> stopLumberjack(context.getSource().getPlayerOrException()))))
                     .then(Commands.literal("go")
                         .then(Commands.argument("location", StringArgumentType.word())
-                            .executes(context -> sendNpcToLocation(context.getSource().getPlayerOrException(),
-                                getString(context, "npc"), getString(context, "location"))))))
+                            .executes(context -> sendNearestNpcToLocation(context.getSource().getPlayerOrException(),
+                                getString(context, "location"))))))
                 .then(Commands.literal("create")
                     .then(Commands.literal("civilization")
                         .then(Commands.argument("name", StringArgumentType.string())
@@ -180,7 +184,7 @@ public class AICivilizationMod implements ModInitializer {
                     .then(Commands.literal("stop")
                         .executes(context -> stopDebugWatch(context.getSource().getPlayerOrException()))))
                 .then(Commands.literal("nation")
-                    .executes(context -> listNations(context.getSource().getPlayerOrException()))
+                    .executes(context -> showNearestNation(context.getSource().getPlayerOrException()))
                     .then(Commands.literal("size")
                         .executes(context -> showNationSize(context.getSource()))))));
         LOGGER.info("AI Civilization inicializado para Minecraft 1.21.10");
@@ -210,7 +214,8 @@ public class AICivilizationMod implements ModInitializer {
         if (nation.citizens().size() == 1) {
             BlockPos standardPos = new BlockPos(nation.x(),
                 level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, nation.x(), nation.z()), nation.z());
-            if (level.getBlockState(standardPos).isAir()
+            net.minecraft.world.level.block.state.BlockState standardState = level.getBlockState(standardPos);
+            if ((standardState.isAir() || standardState.canBeReplaced())
                 && level.getBlockState(standardPos.below()).isFaceSturdy(level, standardPos.below(), net.minecraft.core.Direction.UP)) {
                 level.setBlockAndUpdate(standardPos, standardFor(nation.name()).defaultBlockState());
                 BlockEntity blockEntity = level.getBlockEntity(standardPos);
@@ -749,6 +754,39 @@ public class AICivilizationMod implements ModInitializer {
         return citizens.stream().filter(npc -> npc.getPersonalName().equalsIgnoreCase(identifier)
                 || npc.getDisplayNameText().equalsIgnoreCase(identifier))
             .findFirst().orElse(null);
+    }
+
+    private int sendNearestNpcToLocation(ServerPlayer player, String locationName) {
+        CitizenEntity nearest = findNearestNpc(player);
+        if (nearest == null) {
+            player.sendSystemMessage(ChatMessages.error("Não há cidadãos próximos. Use /aiciv npc para invocar um."));
+            return 0;
+        }
+        return sendNpcToLocation(player, nearest.getPersonalName(), locationName);
+    }
+
+    private int showNearestNation(ServerPlayer player) {
+        ServerLevel level = player.level();
+        CivilizationData data = CivilizationData.get(level);
+        CivilizationData.Nation nation = data.findNationAt(player.blockPosition(), level.dimension().location());
+        if (nation == null) {
+            CitizenEntity nearest = findNearestNpc(player);
+            if (nearest != null && nearest.getNationId() != null) {
+                nation = data.getNation(nearest.getNationId());
+            }
+        }
+        if (nation == null) {
+            player.sendSystemMessage(ChatMessages.info("Você não está em um território de nação e não há cidadãos com nação por perto. Use /aiciv list nation."));
+            return 0;
+        }
+        List<CitizenEntity> citizens = getCitizens(player);
+        String founder = nation.citizens().isEmpty() ? "desconhecido" : findCitizenName(citizens, nation.citizens().get(0));
+        player.sendSystemMessage(ChatMessages.title("Nação — " + nation.name()));
+        player.sendSystemMessage(ChatMessages.info("Centro/Estandarte: " + nation.x() + ", " + nation.y() + ", " + nation.z()
+            + " | Dimensão: " + nation.dimension().getPath()));
+        player.sendSystemMessage(ChatMessages.info("Fundador: " + founder + " | Cidadãos: " + nation.citizens().size()
+            + " | Raio territorial: " + CivilizationData.NATION_RADIUS_BLOCKS + " blocos"));
+        return 1;
     }
 
     private String generateBrazilianName(ServerPlayer player) {
