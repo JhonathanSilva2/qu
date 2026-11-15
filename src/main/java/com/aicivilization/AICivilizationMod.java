@@ -323,8 +323,8 @@ public class AICivilizationMod implements ModInitializer {
         }
 
         List<BlockPos> spawnPositions = findCivilizationSpawnPositions(level, center);
-        if (spawnPositions.size() < 4) {
-            player.sendSystemMessage(ChatMessages.error("Não encontrei quatro pontos seguros para os cidadãos."));
+        if (spawnPositions.size() < 5) {
+            player.sendSystemMessage(ChatMessages.error("Não encontrei cinco pontos seguros para os cidadãos."));
             return 0;
         }
 
@@ -370,12 +370,13 @@ public class AICivilizationMod implements ModInitializer {
         boolean jobsStarted = citizens.get(0).startLumberjack()
             && citizens.get(1).startStorage()
             && citizens.get(2).startMiner()
-            && citizens.get(3).startBuilder();
+            && citizens.get(3).startBuilder()
+            && citizens.get(4).startBuilder();
         if (!jobsStarted) {
             citizens.forEach(Entity::discard);
             level.setBlockAndUpdate(center, Blocks.AIR.defaultBlockState());
             data.removeNation(nation.id());
-            player.sendSystemMessage(ChatMessages.error("A civilização não pôde iniciar os quatro trabalhos; tente em outra área."));
+            player.sendSystemMessage(ChatMessages.error("A civilização não pôde iniciar os cinco trabalhos; tente em outra área."));
             return 0;
         }
         citizens.getFirst().announce("Fundei " + nation.name() + "! Nossa equipe já está trabalhando.");
@@ -383,7 +384,8 @@ public class AICivilizationMod implements ModInitializer {
         player.sendSystemMessage(ChatMessages.info(citizens.get(0).getPersonalName() + " foi criado como LumberJack."));
         player.sendSystemMessage(ChatMessages.info(citizens.get(1).getPersonalName() + " foi criado como Storager."));
         player.sendSystemMessage(ChatMessages.info(citizens.get(2).getPersonalName() + " foi criado como Miner."));
-        player.sendSystemMessage(ChatMessages.info(citizens.get(3).getPersonalName() + " foi criado como Builder."));
+        player.sendSystemMessage(ChatMessages.info(citizens.get(3).getPersonalName() + " foi criado como Builder #1 (Estruturas/Reflorestamento)."));
+        player.sendSystemMessage(ChatMessages.info(citizens.get(4).getPersonalName() + " foi criado como Builder #2 (Estradas/Manutenção)."));
         return 1;
     }
 
@@ -436,9 +438,9 @@ public class AICivilizationMod implements ModInitializer {
 
     private List<BlockPos> findCivilizationSpawnPositions(ServerLevel level, BlockPos center) {
         List<BlockPos> positions = new ArrayList<>();
-        for (int radius = 2; radius <= 6 && positions.size() < 4; radius++) {
-            for (int dx = -radius; dx <= radius && positions.size() < 4; dx++) {
-                for (int dz = -radius; dz <= radius && positions.size() < 4; dz++) {
+        for (int radius = 2; radius <= 7 && positions.size() < 5; radius++) {
+            for (int dx = -radius; dx <= radius && positions.size() < 5; dx++) {
+                for (int dz = -radius; dz <= radius && positions.size() < 5; dz++) {
                     if (Math.max(Math.abs(dx), Math.abs(dz)) != radius) continue;
                     int x = center.getX() + dx;
                     int z = center.getZ() + dz;

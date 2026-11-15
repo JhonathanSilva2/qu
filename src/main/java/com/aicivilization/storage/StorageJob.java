@@ -148,14 +148,18 @@ public final class StorageJob implements ProfessionJob {
         if (current != null && current.dimension().equals(level.dimension().location())
             && outsideStandardExclusion(current.center(), nation)) return true;
 
-        // Cardinal directions first (East, West, South, North) so the warehouse aligns directly with the town center roads!
+        // Village Map Layout:
+        // - 10x10 Village Center occupies dx in [-5..+4]
+        // - 15x3 Center->Warehouse avenue occupies dx in [+5..+19]
+        // - 10x10 Warehouse occupies dx in [+20..+29] -> center at x = nation.x() + 25, z = nation.z()
         int[][] directions = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
-        int[] distances = {15, 18, 22};
+        int[] distances = {25, 22, 18};
         BlockPos bestCandidate = null;
         int bestScore = Integer.MAX_VALUE;
 
         for (int distance : distances) {
-            for (int[] direction : directions) {
+            for (int dirIdx = 0; dirIdx < directions.length; dirIdx++) {
+                int[] direction = directions[dirIdx];
                 int x = nation.x() + direction[0] * distance;
                 int z = nation.z() + direction[1] * distance;
                 BlockPos probe = new BlockPos(x, nation.y(), z);
@@ -166,13 +170,16 @@ public final class StorageJob implements ProfessionJob {
                 if (!nation.contains(candidate.offset(10, 0, 0)) || !nation.contains(candidate.offset(-10, 0, 0))
                     || !nation.contains(candidate.offset(0, 0, 10)) || !nation.contains(candidate.offset(0, 0, -10))) continue;
 
-                int score = evaluateWarehouseSiteScore(level, candidate) + (distance - 15) * 8;
+                // Prioritize East (+X, dirIdx == 0) at distance 25 to match the Village Map (10x10 Center -> 15x3 Road -> 10x10 Warehouse)
+                int directionPenalty = dirIdx * 200;
+                int score = evaluateWarehouseSiteScore(level, candidate) + Math.abs(distance - 25) * 8 + directionPenalty;
                 if (score < bestScore) {
                     bestScore = score;
                     bestCandidate = candidate;
                 }
+                if (bestCandidate != null && distance == 25 && dirIdx == 0) break;
             }
-            if (bestCandidate != null && distance == 15) break; // Prioritize 15 blocks away!
+            if (bestCandidate != null && distance == 25) break; // Prioritize 25 blocks away (15-block road between 10x10 plots)!
         }
         if (bestCandidate != null) {
             data.setWarehouse(nation.id(), bestCandidate, 12, level.dimension().location());
@@ -267,18 +274,18 @@ public final class StorageJob implements ProfessionJob {
             if (firstRequest) citizen.announce("Solicitei ao Builder um terreno plano de 10x10 para começar a warehouse.");
             if (!isCitizenInsideWarehouse(citizen, warehouse)) {
                 if (citizen.getNavigation().isDone())
-                    citizen.getNavigation().moveTo(warehouse.x() + 0.5, warehouse.y(), warehouse.z() + 0.5, 0.9);
+                    CitizenEntity.moveTowards(citizen, level, warehouse.x() + 0.5, warehouse.y(), warehouse.z() + 0.5, 0.9);
                 return;
             }
-            // Before the Builder finishes the plot, nearby unrelated chests are not
-            // part of this warehouse and must not block inventory-only tool requests.
-            if (processRequests(citizen, level, data, warehouse, List.of(), null)) return;
+            // Even before the Builder finishes the 10x10 plot, allow Storager to use any existing chests at the Warehouse
+            // so resource/tool requests (like crafting planks from logs) are never blocked.
+            if (processRequests(citizen, level, data, warehouse, chests, warehouse.inbox())) return;
             if (chests.isEmpty()) takeLogsFromNearbyCitizen(citizen, level, warehouse, 2);
             return;
         }
         if (!isCitizenInsideWarehouse(citizen, warehouse)) {
             if (citizen.getNavigation().isDone())
-                citizen.getNavigation().moveTo(warehouse.x() + 0.5, warehouse.y(), warehouse.z() + 0.5, 0.9);
+                CitizenEntity.moveTowards(citizen, level, warehouse.x() + 0.5, warehouse.y(), warehouse.z() + 0.5, 0.9);
             return;
         }
 
@@ -452,9 +459,7 @@ public final class StorageJob implements ProfessionJob {
         // If no chests exist yet in the Warehouse, walk inside and hand resources directly to the Storager!
         if (!hasValidInbox && allChests.isEmpty()) {
             if (!isCitizenInsideWarehouse(citizen, warehouse)) {
-                if (citizen.getNavigation().isDone()) {
-                    citizen.getNavigation().moveTo(warehouse.x() + 0.5, warehouse.y(), warehouse.z() + 0.5, 0.95);
-                }
+                CitizenEntity.moveTowards(citizen, level, warehouse.x() + 0.5, warehouse.y(), warehouse.z() + 0.5, 0.95);
                 return true;
             }
             UUID storagerId = data.storager(citizen.getNationId());
@@ -476,10 +481,7 @@ public final class StorageJob implements ProfessionJob {
 
         BlockPos targetChestPos = hasValidInbox ? inbox : allChests.get(0);
         if (citizen.distanceToSqr(targetChestPos.getX() + 0.5, targetChestPos.getY(), targetChestPos.getZ() + 0.5) > 16.0) {
-            if (citizen.getNavigation().isDone() || citizen.getNavigation().getTargetPos() == null
-                || citizen.getNavigation().getTargetPos().distSqr(targetChestPos) > 4.0) {
-                citizen.getNavigation().moveTo(targetChestPos.getX() + 0.5, targetChestPos.getY(), targetChestPos.getZ() + 0.5, 0.95);
-            }
+            CitizenEntity.moveTowardsPos(citizen, level, targetChestPos, 0.95);
             return true;
         }
 
@@ -594,7 +596,7 @@ public final class StorageJob implements ProfessionJob {
                 ItemStack stack = chest.getItem(slot);
                 if (!isSapling(stack)) continue;
                 if (citizen.distanceToSqr(pos.getX() + 0.5, pos.getY(), pos.getZ() + 0.5) > 16.0) {
-                    citizen.getNavigation().moveTo(pos.getX() + 0.5, pos.getY(), pos.getZ() + 0.5, 0.9);
+                    CitizenEntity.moveTowardsPos(citizen, level, pos, 0.9);
                     return true;
                 }
                 int amount = Math.min(64, stack.getCount());
@@ -667,10 +669,7 @@ public final class StorageJob implements ProfessionJob {
                 if (targetItem == null && logToConvert == null) continue;
 
                 if (citizen.distanceToSqr(chestPos.getX() + 0.5, chestPos.getY() + 0.5, chestPos.getZ() + 0.5) > 16.0) {
-                    if (citizen.getNavigation().isDone() || citizen.getNavigation().getTargetPos() == null
-                        || citizen.getNavigation().getTargetPos().distSqr(chestPos) > 4.0) {
-                        citizen.getNavigation().moveTo(chestPos.getX() + 0.5, chestPos.getY(), chestPos.getZ() + 0.5, 0.95);
-                    }
+                    CitizenEntity.moveTowardsPos(citizen, level, chestPos, 0.95);
                     return true;
                 }
 
@@ -720,7 +719,11 @@ public final class StorageJob implements ProfessionJob {
             Item targetInStorager = findMatchingItemInContainer(storager.getNpcInventory(), item, matchTag);
             Item logInStorager = (targetInStorager == null && isPlanks) ? firstLogItem(storager.getNpcInventory()) : null;
             if (targetInStorager != null || logInStorager != null) {
-                if (!isCitizenInsideWarehouse(citizen, warehouse) || citizen.distanceToSqr(storager) > 16.0) {
+                if (!isCitizenInsideWarehouse(citizen, warehouse)) {
+                    CitizenEntity.moveTowards(citizen, level, warehouse.x() + 0.5, warehouse.y(), warehouse.z() + 0.5, 0.95);
+                    return true;
+                }
+                if (citizen.distanceToSqr(storager) > 16.0) {
                     if (citizen.getNavigation().isDone()) citizen.getNavigation().moveTo(storager, 0.95);
                     return true;
                 }
@@ -760,14 +763,17 @@ public final class StorageJob implements ProfessionJob {
             }
         }
 
-        // 3. If the citizen has an open request for this resource (excluding dirt, which Builder can dig if out of stock), walk into the Warehouse to wait for it!
+        // 3. If the citizen has an open request for this resource (excluding dirt, which Builder can dig if out of stock), walk into the Warehouse and wait passively!
         if (item != Items.DIRT) {
             for (CivilizationData.StorageRequest req : data.openStorageRequests(nationId)) {
                 if (req.requesterId().equals(citizen.getUUID()) && req.itemId().equals(requestId)) {
-                    if (warehouse != null && warehouse.dimension().equals(level.dimension().location())
-                        && !isCitizenInsideWarehouse(citizen, warehouse)) {
-                        if (citizen.getNavigation().isDone()) {
-                            citizen.getNavigation().moveTo(warehouse.x() + 0.5, warehouse.y(), warehouse.z() + 0.5, 0.95);
+                    if (warehouse != null && warehouse.dimension().equals(level.dimension().location())) {
+                        if (!isCitizenInsideWarehouse(citizen, warehouse)) {
+                            if (citizen.getNavigation().isDone()) {
+                                CitizenEntity.moveTowards(citizen, level, warehouse.x() + 0.5, warehouse.y(), warehouse.z() + 0.5, 0.95);
+                            }
+                        } else {
+                            citizen.getNavigation().stop();
                         }
                         return true;
                     }
@@ -776,6 +782,34 @@ public final class StorageJob implements ProfessionJob {
             }
         }
         return false;
+    }
+
+    /** Returns a formatted description if the citizen is currently waiting in/for the Warehouse with an open request, or empty string. */
+    public static String describeOpenWaitRequest(CitizenEntity citizen, ServerLevel level) {
+        if (citizen.getNationId() == null) return "";
+        CivilizationData data = CivilizationData.get(level);
+        CivilizationData.Warehouse warehouse = data.warehouse(citizen.getNationId());
+        boolean inside = warehouse != null && isCitizenInsideWarehouse(citizen, warehouse);
+        String prefix = inside ? "Aguardando na Warehouse: " : "Indo à Warehouse pedir: ";
+        for (CivilizationData.StorageRequest req : data.openStorageRequests(citizen.getNationId())) {
+            if (!req.requesterId().equals(citizen.getUUID())) continue;
+            String itemLabel;
+            if (req.itemId().equals(BEST_AXE_REQUEST_ID)) itemLabel = "Machado";
+            else if (req.itemId().equals(BEST_PICKAXE_REQUEST_ID)) itemLabel = "Picareta";
+            else if (req.itemId().startsWith(BEST_PICKAXE_REQUEST_ID + ".tier_")) {
+                itemLabel = "Picareta tier " + req.itemId().substring((BEST_PICKAXE_REQUEST_ID + ".tier_").length());
+            } else if (req.itemId().equals(BEST_SHOVEL_REQUEST_ID)) itemLabel = "Pá";
+            else if (req.itemId().equals("ai_civilization:resource:minecraft:oak_planks")) itemLabel = "Tábuas";
+            else if (req.itemId().equals("ai_civilization:resource:minecraft:oak_stairs")) itemLabel = "Escadas";
+            else if (req.itemId().equals("ai_civilization:resource:minecraft:dirt")) itemLabel = "Terra";
+            else if (req.itemId().startsWith(RESOURCE_REQUEST_PREFIX)) {
+                itemLabel = req.itemId().substring(RESOURCE_REQUEST_PREFIX.length());
+            } else {
+                itemLabel = req.itemId();
+            }
+            return prefix + req.count() + "x " + itemLabel;
+        }
+        return "";
     }
 
     private static Item findMatchingItemInContainer(Container container, Item item, TagKey<Item> matchTag) {
@@ -820,10 +854,7 @@ public final class StorageJob implements ProfessionJob {
                     int slot = findItem(chest, recipe.tool());
                     if (slot < 0) continue;
                     if (citizen.distanceToSqr(chestPos.getX() + 0.5, chestPos.getY() + 0.5, chestPos.getZ() + 0.5) > 16.0) {
-                        if (citizen.getNavigation().isDone() || citizen.getNavigation().getTargetPos() == null
-                            || citizen.getNavigation().getTargetPos().distSqr(chestPos) > 4.0) {
-                            citizen.getNavigation().moveTo(chestPos.getX() + 0.5, chestPos.getY(), chestPos.getZ() + 0.5, 0.95);
-                        }
+                        CitizenEntity.moveTowardsPos(citizen, level, chestPos, 0.95);
                         return true;
                     }
                     ItemStack tool = chest.getItem(slot).split(1);
@@ -850,7 +881,11 @@ public final class StorageJob implements ProfessionJob {
             for (ToolRecipe recipe : recipes) {
                 int slot = findItem(storager.getNpcInventory(), recipe.tool());
                 if (slot < 0) continue;
-                if (!isCitizenInsideWarehouse(citizen, warehouse) || citizen.distanceToSqr(storager) > 16.0) {
+                if (!isCitizenInsideWarehouse(citizen, warehouse)) {
+                    CitizenEntity.moveTowards(citizen, level, warehouse.x() + 0.5, warehouse.y(), warehouse.z() + 0.5, 0.95);
+                    return true;
+                }
+                if (citizen.distanceToSqr(storager) > 16.0) {
                     if (citizen.getNavigation().isDone()) citizen.getNavigation().moveTo(storager, 0.95);
                     return true;
                 }
@@ -872,12 +907,15 @@ public final class StorageJob implements ProfessionJob {
             }
         }
 
-        // 3. If a tool request is already pending in the queue, walk to the Warehouse to wait for the Storager to craft/hand it over!
+        // 3. If a tool request is already pending in the queue, walk to the Warehouse and wait passively for the Storager!
         if (hasPendingToolRequest(data, citizen, recipes)) {
-            if (warehouse != null && warehouse.dimension().equals(level.dimension().location())
-                && !isCitizenInsideWarehouse(citizen, warehouse)) {
-                if (citizen.getNavigation().isDone()) {
-                    citizen.getNavigation().moveTo(warehouse.x() + 0.5, warehouse.y(), warehouse.z() + 0.5, 0.95);
+            if (warehouse != null && warehouse.dimension().equals(level.dimension().location())) {
+                if (!isCitizenInsideWarehouse(citizen, warehouse)) {
+                    if (citizen.getNavigation().isDone()) {
+                        CitizenEntity.moveTowards(citizen, level, warehouse.x() + 0.5, warehouse.y(), warehouse.z() + 0.5, 0.95);
+                    }
+                } else {
+                    citizen.getNavigation().stop();
                 }
             }
             return true;

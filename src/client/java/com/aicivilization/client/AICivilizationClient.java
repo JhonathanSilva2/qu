@@ -8,14 +8,19 @@ import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.fabricmc.api.ClientModInitializer;
 import com.mojang.blaze3d.platform.InputConstants;
+import com.mojang.blaze3d.vertex.PoseStack;
+import net.minecraft.ChatFormatting;
 import net.minecraft.client.KeyMapping;
 import org.lwjgl.glfw.GLFW;
 import net.minecraft.client.model.PlayerModel;
 import net.minecraft.client.model.geom.ModelLayers;
+import net.minecraft.client.renderer.SubmitNodeCollector;
 import net.minecraft.client.renderer.entity.EntityRenderers;
 import net.minecraft.client.renderer.entity.EntityRendererProvider;
 import net.minecraft.client.renderer.entity.HumanoidMobRenderer;
 import net.minecraft.client.renderer.entity.state.AvatarRenderState;
+import net.minecraft.client.renderer.state.CameraRenderState;
+import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceLocation;
 
 public class AICivilizationClient implements ClientModInitializer {
@@ -91,6 +96,11 @@ public class AICivilizationClient implements ClientModInitializer {
         }
 
         @Override
+        protected boolean shouldShowName(CitizenEntity citizen, double distanceToCameraSq) {
+            return distanceToCameraSq < 1024.0 && citizen.hasCustomName();
+        }
+
+        @Override
         public void extractRenderState(CitizenEntity citizen, AvatarRenderState state, float partialTick) {
             super.extractRenderState(citizen, state, partialTick);
             state.showHat = true;
@@ -99,7 +109,46 @@ public class AICivilizationClient implements ClientModInitializer {
             state.showRightPants = true;
             state.showLeftSleeve = true;
             state.showRightSleeve = true;
+            String workStatus = citizen.getSyncedWorkStatus();
+            if (workStatus != null && !workStatus.isBlank()) {
+                ChatFormatting color = workStatus.startsWith("Aguardando")
+                    ? ChatFormatting.YELLOW
+                    : ChatFormatting.AQUA;
+                state.scoreText = Component.literal("⚙ " + workStatus).withStyle(color);
+            } else {
+                state.scoreText = null;
+            }
             ENTITY_TEXTURES.put(citizen.getId(), getTextureForProfession(citizen.getProfessionId()));
+        }
+
+        @Override
+        protected void submitNameTag(AvatarRenderState state, PoseStack poseStack, SubmitNodeCollector collector, CameraRenderState cameraState) {
+            if (state.nameTag == null) return;
+            poseStack.pushPose();
+            if (state.scoreText != null && state.distanceToCameraSq < 1024.0) {
+                collector.submitNameTag(
+                    poseStack,
+                    state.nameTagAttachment,
+                    0,
+                    state.scoreText,
+                    !state.isDiscrete,
+                    state.lightCoords,
+                    state.distanceToCameraSq,
+                    cameraState
+                );
+                poseStack.translate(0.0F, 9.0F * 1.15F * 0.025F, 0.0F);
+            }
+            collector.submitNameTag(
+                poseStack,
+                state.nameTagAttachment,
+                0,
+                state.nameTag,
+                !state.isDiscrete,
+                state.lightCoords,
+                state.distanceToCameraSq,
+                cameraState
+            );
+            poseStack.popPose();
         }
 
         @Override
