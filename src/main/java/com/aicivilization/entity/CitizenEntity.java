@@ -365,21 +365,21 @@ public class CitizenEntity extends PathfinderMob {
 
         if (workStuckNoticeCooldown > 0) workStuckNoticeCooldown--;
 
-        // Autonomous Navigation Watchdog: if stuck trying to reach a work target for 10s (200 ticks),
-        // teleport to the nation center banner and safely resume.
-        if (hasActiveProfession() && workNavigationExpected(level)) {
+        // Autonomous Navigation Watchdog: if stuck trying to reach a work target for 30s (600 ticks),
+        // teleport to the nation center banner as a last resort and safely resume.
+        if (hasActiveProfession() && workNavigationExpected(level) && !getNavigation().isDone() && !this.swinging) {
             if (distanceToSqr(workLastX, workLastY, workLastZ) < 0.04) workStuckTicks++;
             else workStuckTicks = 0;
             workLastX = getX();
             workLastY = getY();
             workLastZ = getZ();
-            if (workStuckTicks >= 200) {
+            if (workStuckTicks >= 600) {
                 workStuckTicks = 0;
                 teleportToNationCenter(level);
                 getNavigation().stop();
                 if (workStuckNoticeCooldown <= 0) {
-                    announce("Fiquei bloqueado por muito tempo; fui levado ao centro da cidade para reiniciar meu trabalho.");
-                    workStuckNoticeCooldown = 400;
+                    announce("Fiquei bloqueado por muito tempo; fui levado ao centro da cidade como último recurso.");
+                    workStuckNoticeCooldown = 600;
                 }
             }
         } else {
@@ -544,8 +544,10 @@ public class CitizenEntity extends PathfinderMob {
             int surfaceY = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, nation.x(), nation.z());
             returnPosition = new BlockPos(nation.x(), surfaceY, nation.z());
         }
-        double distSqr = this.distanceToSqr(returnPosition.getX() + 0.5, returnPosition.getY(), returnPosition.getZ() + 0.5);
-        if (distSqr > 48.0 * 48.0) {
+        double dx = this.getX() - (returnPosition.getX() + 0.5);
+        double dz = this.getZ() - (returnPosition.getZ() + 0.5);
+        double horizontalDistSqr = dx * dx + dz * dz;
+        if (horizontalDistSqr > 48.0 * 48.0) {
             // Vanilla pathfinding cannot resolve paths longer than 32-48 blocks. Teleport safely back into nation bounds.
             teleportToNationCenter(level);
             announce("Estava muito longe do meu país; fui trazido de volta para dentro da fronteira.");

@@ -157,7 +157,7 @@ public final class MinerJob implements ProfessionJob {
     }
 
     public String workStatus(CitizenEntity citizen, ServerLevel level) {
-        if (oreDeliveryPending || fullResourceStack(citizen) != null) return "Entregando recursos ao armazém";
+        if (oreDeliveryPending) return "Mochila cheia: entregando recursos ao armazém";
         if (toolPickupPending || !isPickaxe(citizen.getMainHandItem())) return "Buscando uma picareta adequada";
         if (mineOrigin == null) return "Escolhendo um local seguro para a mina";
         BlockPos approach = mineOrigin.relative(direction, step).below(step);
@@ -168,6 +168,10 @@ public final class MinerJob implements ProfessionJob {
     }
 
     public boolean needsNavigation(CitizenEntity citizen, ServerLevel level) {
+        if (oreDeliveryPending) {
+            BlockPos base = basePosition(citizen, level);
+            return citizen.distanceToSqr(base.getX() + 0.5, base.getY(), base.getZ() + 0.5) > 16.0;
+        }
         if (toolPickupPending || (!isPickaxe(citizen.getMainHandItem()) && bestInventoryPickaxe(citizen) == null)) {
             return !citizen.getNavigation().isDone();
         }
@@ -182,6 +186,15 @@ public final class MinerJob implements ProfessionJob {
         if (warehouse != null && warehouse.dimension().equals(level.dimension().location())) return warehouse.center();
         CivilizationData.Nation nation = data.getNation(citizen.getNationId());
         return nation == null ? citizen.blockPosition() : nation.center().above();
+    }
+
+    private boolean isInventoryFullOrNearCapacity(CitizenEntity citizen) {
+        int emptySlots = 0;
+        for (int slot = 0; slot < citizen.getNpcInventory().getContainerSize(); slot++) {
+            ItemStack stack = citizen.getNpcInventory().getItem(slot);
+            if (stack.isEmpty()) emptySlots++;
+        }
+        return emptySlots < 3;
     }
 
     /** Gets a suitable pickaxe before allowing the Miner to leave the warehouse base. */
@@ -258,16 +271,25 @@ public final class MinerJob implements ProfessionJob {
         collectDrops(citizen, level);
         sealPendingWater(citizen, level);
 
-        if (oreDeliveryPending) {
-            if (deliverOreResources(citizen, level)) return;
-            oreDeliveryPending = false;
-            StorageJob.depositAllResources(citizen, level);
+        // Somente retorna à base para descarregar quando a mochila estiver quase cheia
+        if (!oreDeliveryPending && isInventoryFullOrNearCapacity(citizen)) {
+            oreDeliveryPending = true;
+            announceThrottled(citizen, FULL_PHRASES);
         }
 
-        Item fullStack = fullResourceStack(citizen);
-        if (fullStack != null && StorageJob.deliverResourcePack(citizen, level, fullStack, 64)) {
-            announceThrottled(citizen, FULL_PHRASES);
-            return;
+        if (oreDeliveryPending) {
+            BlockPos base = basePosition(citizen, level);
+            double baseX = base.getX() + 0.5;
+            double baseY = base.getY();
+            double baseZ = base.getZ() + 0.5;
+            if (citizen.distanceToSqr(baseX, baseY, baseZ) > 16.0) {
+                if (citizen.getNavigation().isDone()) citizen.getNavigation().moveTo(baseX, baseY, baseZ, 0.9);
+                return;
+            }
+            if (StorageJob.depositAllResources(citizen, level)) {
+                citizen.announce("Descarreguei minha mochila cheia no armazém e vou voltar para a mina!");
+            }
+            oreDeliveryPending = false;
         }
 
         if (mineOrigin == null) chooseMineSite(citizen, level);
@@ -346,7 +368,6 @@ public final class MinerJob implements ProfessionJob {
         if (isOre(state)) {
             citizen.announce(random(RICH_PHRASES));
             mineOreVein(citizen, level, target, state);
-            oreDeliveryPending = true;
             blockCursor++;
             return;
         }
@@ -616,13 +637,6 @@ public final class MinerJob implements ProfessionJob {
         }
     }
 
-    private Item fullResourceStack(CitizenEntity citizen) {
-        for (int slot = 0; slot < citizen.getNpcInventory().getContainerSize(); slot++) {
-            ItemStack stack = citizen.getNpcInventory().getItem(slot);
-            if (stack.getCount() >= 64 && !isPickaxe(stack)) return stack.getItem();
-        }
-        return null;
-    }
 
     private Item bestInventoryPickaxe(CitizenEntity citizen) {
         return bestInventoryPickaxe(citizen, 0);
@@ -669,23 +683,6 @@ public final class MinerJob implements ProfessionJob {
         }
     }
 
-    private boolean deliverOreResources(CitizenEntity citizen, ServerLevel level) {
-        for (int slot = 0; slot < citizen.getNpcInventory().getContainerSize(); slot++) {
-            ItemStack stack = citizen.getNpcInventory().getItem(slot);
-            if (!stack.isEmpty() && isOreDrop(stack.getItem())) {
-                return StorageJob.deliverResourcePack(citizen, level, stack.getItem(), stack.getCount());
-            }
-        }
-        return false;
-    }
-
-    private boolean isOreDrop(Item item) {
-        String path = BuiltInRegistries.ITEM.getKey(item).getPath();
-        return path.startsWith("raw_") || path.equals("coal") || path.equals("diamond")
-            || path.equals("emerald") || path.equals("redstone") || path.equals("lapis_lazuli")
-            || path.equals("quartz") || path.equals("ancient_debris") || path.equals("netherite_scrap")
-            || path.equals("raw_copper") || path.equals("copper_ingot") || path.equals("iron_ingot") || path.equals("gold_ingot");
-    }
 
     private int pickaxeTier(ItemStack stack) {
         return pickaxeTier(stack.getItem());
