@@ -7,6 +7,7 @@ import net.minecraft.core.Direction;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.entity.Entity;
 import net.minecraft.tags.ItemTags;
 import net.minecraft.tags.BlockTags;
 import net.minecraft.tags.TagKey;
@@ -52,7 +53,7 @@ public final class StorageJob {
     private int lastMissingAxeMaterialsNotice = -1000;
     private int decorationIndex;
     private boolean decoratingFence;
-    private boolean levelingNoticeSent;
+    private UUID resourceDonorId;
 
     public static boolean ensureWarehouseLocation(CitizenEntity citizen, ServerLevel level) {
         CivilizationData data = CivilizationData.get(level);
@@ -99,14 +100,26 @@ public final class StorageJob {
             citizen.announce("Estou definindo o armazém de " + citizen.getNationName() + " nesta área.");
         }
         if (!warehouse.dimension().equals(level.dimension().location())) return;
-        if (citizen.distanceToSqr(warehouse.x() + 0.5, warehouse.y(), warehouse.z() + 0.5) > 196.0) {
+        boolean atDonor = false;
+        if (resourceDonorId != null) {
+            Entity donorEntity = level.getEntity(resourceDonorId);
+            if (donorEntity instanceof CitizenEntity donor && donor.getNationId().equals(nationId)) {
+                if (citizen.distanceToSqr(donor) > 16.0) {
+                    if (citizen.getNavigation().isDone()) citizen.getNavigation().moveTo(donor, 0.9);
+                    return;
+                }
+                atDonor = true;
+            } else {
+                resourceDonorId = null;
+            }
+        }
+        if (!atDonor && citizen.distanceToSqr(warehouse.x() + 0.5, warehouse.y(), warehouse.z() + 0.5) > 196.0) {
             if (citizen.getNavigation().isDone())
                 citizen.getNavigation().moveTo(warehouse.x() + 0.5, warehouse.y(), warehouse.z() + 0.5, 0.9);
             return;
         }
 
         List<BlockPos> chests = findChests(level, warehouse);
-        if (chests.isEmpty() && levelWarehousePlatform(citizen, level, warehouse)) return;
         BlockPos inbox = warehouse.inbox();
         if (inbox == null || !(level.getBlockEntity(inbox) instanceof ChestBlockEntity)) {
             if (!chests.isEmpty()) {
@@ -139,10 +152,10 @@ public final class StorageJob {
         CivilizationData data = CivilizationData.get(level);
         CivilizationData.Warehouse warehouse = data.warehouse(citizen.getNationId());
         if (warehouse == null) return "warehouse=missing, requests=" + data.openStorageRequests(citizen.getNationId()).size();
+        if (resourceDonorId != null) return "phase=walking-to-lumberjack, donor=" + resourceDonorId;
         List<BlockPos> chests = findChests(level, warehouse);
         String phase;
         if (citizen.distanceToSqr(warehouse.x() + 0.5, warehouse.y(), warehouse.z() + 0.5) > 64.0) phase = "walking-to-warehouse";
-        else if (chests.isEmpty() && !isWarehousePlatformLevel(level, warehouse)) phase = "leveling-warehouse-platform";
         else if (!warehouse.hasInbox() || !(level.getBlockEntity(warehouse.inbox()) instanceof ChestBlockEntity)) phase = "building-inbox";
         else if (!data.openStorageRequests(citizen.getNationId()).isEmpty()) phase = "handling-requests";
         else if (hasPendingSort((ChestBlockEntity) level.getBlockEntity(warehouse.inbox()))) phase = "sorting-inbox";
@@ -157,11 +170,10 @@ public final class StorageJob {
         CivilizationData data = CivilizationData.get(level);
         CivilizationData.Warehouse warehouse = data.warehouse(citizen.getNationId());
         if (warehouse == null) return "Escolhendo o local do armazém";
+        if (resourceDonorId != null) return "Indo buscar madeira com um cidadão da nação";
         if (citizen.distanceToSqr(warehouse.x() + 0.5, warehouse.y(), warehouse.z() + 0.5) > 196.0)
             return "Indo até o armazém";
         List<BlockPos> chests = findChests(level, warehouse);
-        if (chests.isEmpty() && !isWarehousePlatformLevel(level, warehouse))
-            return "Limpando e nivelando o terreno do armazém";
         if (!warehouse.hasInbox() || !(level.getBlockEntity(warehouse.inbox()) instanceof ChestBlockEntity))
             return "Construindo o baú principal";
         if (!data.openStorageRequests(citizen.getNationId()).isEmpty()) return "Fabricando ferramentas solicitadas";
@@ -340,6 +352,10 @@ public final class StorageJob {
         return retrieveBestTool(citizen, level, eligible, "picareta");
     }
 
+    public static String pickaxeRequestId(int minimumTier) {
+        return minimumTier <= 0 ? BEST_PICKAXE_REQUEST_ID : BEST_PICKAXE_REQUEST_ID + ".tier_" + minimumTier;
+    }
+
     private static int pickaxeTier(Item pickaxe) {
         if (pickaxe == Items.DIAMOND_PICKAXE) return 3;
         if (pickaxe == Items.IRON_PICKAXE) return 2;
@@ -384,10 +400,20 @@ public final class StorageJob {
             if (request.itemId().equals(BEST_AXE_REQUEST_ID)) {
                 recipes = AXE_RECIPES;
                 toolName = "machado";
-            } else if (request.itemId().equals(BEST_PICKAXE_REQUEST_ID)) {
-                recipes = PICKAXE_RECIPES;
+            } else if (request.itemId().equals(BEST_PICKAXE_REQUEST_ID)
+                || request.itemId().startsWith(BEST_PICKAXE_REQUEST_ID + ".tier_")) {
+                int minimumTier = request.itemId().equals(BEST_PICKAXE_REQUEST_ID) ? 0
+                    : parseRequestedPickaxeTier(request.itemId());
+                recipes = PICKAXE_RECIPES.stream().filter(candidate -> pickaxeTier(candidate.tool()) >= minimumTier).toList();
                 toolName = "picareta";
             } else continue;
+            ToolRecipe stocked = recipes.stream()
+                .filter(candidate -> countItem(citizen.getNpcInventory(), chestPositions, level, candidate.tool()) > 0)
+                .findFirst().orElse(null);
+            if (stocked != null) {
+                data.fulfillStorageRequest(request.id());
+                continue;
+            }
             ToolRecipe recipe = findCraftableTool(citizen.getNpcInventory(), chestPositions, level, recipes);
             if (recipe == null && convertLogsToPlanks(citizen, chestPositions, level)) {
                 recipe = findCraftableTool(citizen.getNpcInventory(), chestPositions, level, recipes);
@@ -444,6 +470,15 @@ public final class StorageJob {
             if (materialCount >= 3) return recipe;
         }
         return null;
+    }
+
+    private int parseRequestedPickaxeTier(String requestId) {
+        String prefix = BEST_PICKAXE_REQUEST_ID + ".tier_";
+        try {
+            return Math.max(0, Math.min(3, Integer.parseInt(requestId.substring(prefix.length()))));
+        } catch (NumberFormatException exception) {
+            return 0;
+        }
     }
 
     private boolean convertPlanksToSticks(CitizenEntity citizen, List<BlockPos> chestPositions, ServerLevel level) {
@@ -742,26 +777,41 @@ public final class StorageJob {
         List<CitizenEntity> nearbyCitizens = level.getEntitiesOfClass(CitizenEntity.class, area, other ->
             other != storager && storager.getNationId().equals(other.getNationId()));
         nearbyCitizens.sort(Comparator.comparingDouble(storager::distanceToSqr));
-        for (CitizenEntity source : nearbyCitizens) {
-            for (int slot = 0; slot < source.getNpcInventory().getContainerSize(); slot++) {
-                ItemStack stack = source.getNpcInventory().getItem(slot);
-                if (!stack.is(ItemTags.LOGS)) continue;
-                Item log = stack.getItem();
-                int available = nearbyCitizens.stream().mapToInt(other -> countItem(other.getNpcInventory(), log)).sum();
-                if (available < needed || !storager.getNpcInventory().canAddItem(new ItemStack(log, needed))) continue;
-                int remaining = needed;
-                for (CitizenEntity donor : nearbyCitizens) {
-                    remaining = removeItem(donor.getNpcInventory(), log, remaining);
-                    if (remaining <= 0) break;
+        Entity donorEntity = resourceDonorId == null ? null : level.getEntity(resourceDonorId);
+        CitizenEntity source = donorEntity instanceof CitizenEntity target ? target : null;
+        if (source == null || !nearbyCitizens.contains(source)) {
+            resourceDonorId = null;
+            source = null;
+            for (CitizenEntity candidate : nearbyCitizens) {
+                if (countLogs(candidate.getNpcInventory()) > 0) {
+                    source = candidate;
+                    resourceDonorId = candidate.getUUID();
+                    break;
                 }
-                if (remaining != 0) continue;
-                storager.getNpcInventory().addItem(new ItemStack(log, needed));
-                nearbyCitizens.forEach(donor -> donor.getNpcInventory().setChanged());
-                storager.getNpcInventory().setChanged();
-                return true;
             }
         }
-        return false;
+        if (source == null || countLogs(source.getNpcInventory()) <= 0) {
+            resourceDonorId = null;
+            return false;
+        }
+        if (storager.distanceToSqr(source) > 16.0) {
+            if (storager.getNavigation().isDone()) storager.getNavigation().moveTo(source, 0.9);
+            return false;
+        }
+        Item log = firstLogItem(source.getNpcInventory());
+        if (log == null) {
+            resourceDonorId = null;
+            return false;
+        }
+        int amount = Math.min(needed, countItem(source.getNpcInventory(), log));
+        if (amount <= 0 || !storager.getNpcInventory().canAddItem(new ItemStack(log, amount))) return false;
+        int remaining = removeItem(source.getNpcInventory(), log, amount);
+        if (remaining != 0) return false;
+        storager.getNpcInventory().addItem(new ItemStack(log, amount));
+        source.getNpcInventory().setChanged();
+        storager.getNpcInventory().setChanged();
+        resourceDonorId = null;
+        return true;
     }
 
     private BlockPos findChestPlacement(CitizenEntity citizen, ServerLevel level,
@@ -793,142 +843,6 @@ public final class StorageJob {
         return candidates.stream().filter(pos -> CivilizationData.get(level).findNationAt(pos, level.dimension().location())
             != null && CivilizationData.get(level).findNationAt(pos, level.dimension().location()).id().equals(warehouse.nationId()))
             .findFirst().orElse(null);
-    }
-
-    /** Reconstructible warehouse plan: clear the footprint, then level one block operation per work cycle. */
-    private boolean levelWarehousePlatform(CitizenEntity citizen, ServerLevel level,
-                                           CivilizationData.Warehouse warehouse) {
-        if (!levelingNoticeSent) {
-            citizen.announce("Vou nivelar o terreno do armazém antes de construir os baús.");
-            levelingNoticeSent = true;
-        }
-        BlockPos center = warehouse.center();
-        int targetSurface = center.getY();
-        // Clear tree trunks and foliage first so the terrain pass never mistakes a tree for ground.
-        for (int dz = -3; dz <= 3; dz++) {
-            for (int dx = -3; dx <= 3; dx++) {
-                int x = center.getX() + dx;
-                int z = center.getZ() + dz;
-                BlockPos column = new BlockPos(x, targetSurface, z);
-                if (!level.hasChunkAt(column)) return true;
-                for (int y = targetSurface; y < targetSurface + 32; y++) {
-                    BlockPos obstruction = new BlockPos(x, y, z);
-                    BlockState state = level.getBlockState(obstruction);
-                    if (!state.is(BlockTags.LEAVES) && !state.is(BlockTags.LOGS)) continue;
-                    if (state.is(BlockTags.LOGS) && state.getBlock().asItem() != Items.AIR
-                        && citizen.getNpcInventory().canAddItem(new ItemStack(state.getBlock().asItem()))) {
-                        level.destroyBlock(obstruction, true, citizen);
-                    } else {
-                        level.destroyBlock(obstruction, false, citizen);
-                    }
-                    citizen.announce(state.is(BlockTags.LEAVES)
-                        ? "Estou limpando as folhas da área planejada do armazém."
-                        : "Estou removendo uma árvore que ocupa a área do armazém.");
-                    return true;
-                }
-            }
-        }
-
-        for (int dz = -3; dz <= 3; dz++) {
-            for (int dx = -3; dx <= 3; dx++) {
-                int x = center.getX() + dx;
-                int z = center.getZ() + dz;
-                BlockPos probe = new BlockPos(x, targetSurface, z);
-                if (!level.hasChunkAt(probe)) return true;
-                int surface = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
-                if (surface > targetSurface) {
-                    BlockPos top = new BlockPos(x, surface - 1, z);
-                    BlockState state = level.getBlockState(top);
-                    if (state.isAir() || !state.getFluidState().isEmpty() || state.hasBlockEntity()
-                        || state.getDestroySpeed(level, top) < 0.0f) continue;
-                    Item soil = state.getBlock().asItem();
-                    boolean yieldsSoil = isNaturalGround(state) && isSoilItem(soil);
-                    if (yieldsSoil && !citizen.getNpcInventory().canAddItem(new ItemStack(soil))) continue;
-                    citizen.getLookControl().setLookAt(x + 0.5, top.getY() + 0.5, z + 0.5, 30.0f, 30.0f);
-                    citizen.swing(InteractionHand.MAIN_HAND);
-                    if (level.destroyBlock(top, false, citizen)) {
-                        if (yieldsSoil) citizen.getNpcInventory().addItem(new ItemStack(soil));
-                        return true;
-                    }
-                } else if (surface < targetSurface) {
-                    BlockPos fillPos = new BlockPos(x, surface, z);
-                    ItemStack soil = takeSoil(citizen, level, warehouse, targetSurface);
-                    if (soil.isEmpty()) return true;
-                    citizen.getLookControl().setLookAt(x + 0.5, fillPos.getY() + 0.5, z + 0.5, 30.0f, 30.0f);
-                    citizen.swing(InteractionHand.MAIN_HAND);
-                    Block soilBlock = Block.byItem(soil.getItem());
-                    if (soilBlock == Blocks.AIR || !level.getBlockState(fillPos).isAir()
-                        || !level.setBlockAndUpdate(fillPos, soilBlock.defaultBlockState())) {
-                        citizen.getNpcInventory().addItem(soil);
-                    }
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
-
-    private boolean isWarehousePlatformLevel(ServerLevel level, CivilizationData.Warehouse warehouse) {
-        BlockPos center = warehouse.center();
-        for (int dz = -3; dz <= 3; dz++) {
-            for (int dx = -3; dx <= 3; dx++) {
-                int x = center.getX() + dx;
-                int z = center.getZ() + dz;
-                BlockPos probe = new BlockPos(x, center.getY(), z);
-                if (!level.hasChunkAt(probe)
-                    || level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z) != center.getY()
-                    || !level.getBlockState(probe).isAir()
-                    || !level.getBlockState(probe.above()).isAir()
-                    || !level.getBlockState(probe.below()).isFaceSturdy(level, probe.below(), Direction.UP)) return false;
-            }
-        }
-        return true;
-    }
-
-    private ItemStack takeSoil(CitizenEntity citizen, ServerLevel level,
-                               CivilizationData.Warehouse warehouse, int targetSurface) {
-        for (Item soil : List.of(Items.DIRT, Items.COARSE_DIRT, Items.ROOTED_DIRT,
-            Items.GRASS_BLOCK, Items.PODZOL, Items.MYCELIUM)) {
-            ItemStack stack = citizen.getNpcInventory().removeItemType(soil, 1);
-            if (!stack.isEmpty()) {
-                citizen.getNavigation().stop();
-                return stack;
-            }
-        }
-
-        if (citizen.tickCount % 200 == 0)
-            citizen.announce("Preciso de terra para nivelar o armazém; vou procurar uma coluna alta dentro da área planejada.");
-        BlockPos center = warehouse.center();
-        for (int dz = -3; dz <= 3; dz++) {
-            for (int dx = -3; dx <= 3; dx++) {
-                int x = center.getX() + dx;
-                int z = center.getZ() + dz;
-                BlockPos column = new BlockPos(x, targetSurface, z);
-                if (!level.hasChunkAt(column)) continue;
-                int surface = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
-                if (surface <= targetSurface) continue;
-                BlockPos soilPos = new BlockPos(x, surface - 1, z);
-                BlockState state = level.getBlockState(soilPos);
-                Item soil = state.getBlock().asItem();
-                if (!isNaturalGround(state) || state.hasBlockEntity() || !isSoilItem(soil)
-                    || !citizen.getNpcInventory().canAddItem(new ItemStack(soil))) continue;
-                if (citizen.distanceToSqr(x + 0.5, surface, z + 0.5) > 20.25) {
-                    if (citizen.getNavigation().isDone()) citizen.getNavigation().moveTo(x + 0.5, surface, z + 0.5, 0.8);
-                    return ItemStack.EMPTY;
-                }
-                citizen.getLookControl().setLookAt(x + 0.5, soilPos.getY() + 0.5, z + 0.5, 30.0f, 30.0f);
-                if (level.destroyBlock(soilPos, false, citizen)) {
-                    citizen.getNavigation().stop();
-                    return new ItemStack(soil);
-                }
-            }
-        }
-        return ItemStack.EMPTY;
-    }
-
-    private boolean isSoilItem(Item item) {
-        return item == Items.DIRT || item == Items.COARSE_DIRT || item == Items.ROOTED_DIRT
-            || item == Items.GRASS_BLOCK || item == Items.PODZOL || item == Items.MYCELIUM;
     }
 
     private static List<BlockPos> findChests(ServerLevel level, CivilizationData.Warehouse warehouse) {
@@ -1006,6 +920,23 @@ public final class StorageJob {
             if (stack.is(item)) count += stack.getCount();
         }
         return count;
+    }
+
+    private static int countLogs(Container container) {
+        int count = 0;
+        for (int slot = 0; slot < container.getContainerSize(); slot++) {
+            ItemStack stack = container.getItem(slot);
+            if (stack.is(ItemTags.LOGS)) count += stack.getCount();
+        }
+        return count;
+    }
+
+    private static Item firstLogItem(Container container) {
+        for (int slot = 0; slot < container.getContainerSize(); slot++) {
+            ItemStack stack = container.getItem(slot);
+            if (stack.is(ItemTags.LOGS)) return stack.getItem();
+        }
+        return null;
     }
 
     private static int countItem(Container inventory, List<BlockPos> chestPositions, ServerLevel level, Item item) {

@@ -187,7 +187,7 @@ public final class MinerJob {
 
         if (toolLookupCooldown <= 0) {
             CivilizationData.get(level).requestStorageItem(citizen.getNationId(), citizen.getUUID(),
-                StorageJob.BEST_PICKAXE_REQUEST_ID, 1);
+                StorageJob.pickaxeRequestId(minimumTier), 1);
             announceThrottled(citizen, List.of(minimumTier > 0
                 ? "Não achei a picareta necessária nos baús. Pedi uma melhor ao Storager e vou aguardar na base."
                 : "Não achei picareta nos baús. Pedi uma ao Storager e vou aguardar na base."));
