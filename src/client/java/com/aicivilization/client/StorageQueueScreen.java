@@ -45,7 +45,7 @@ public final class StorageQueueScreen extends Screen {
 
     @Override
     public void render(GuiGraphics graphics, int mouseX, int mouseY, float partialTick) {
-        renderBackground(graphics, mouseX, mouseY, partialTick);
+        graphics.fill(0, 0, width, height, 0xC0101218);
         graphics.fill(panelLeft, panelTop, panelLeft + PANEL_WIDTH, panelTop + PANEL_HEIGHT, 0xE020242B);
         graphics.fill(panelLeft, panelTop, panelLeft + PANEL_WIDTH, panelTop + 2, 0xFF42D9E8);
         graphics.drawCenteredString(font, title, width / 2, panelTop + 13, 0xFFFFFFFF);

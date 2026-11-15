@@ -1,7 +1,6 @@
 package com.aicivilization;
 
 import com.aicivilization.config.ModConfig;
-import com.aicivilization.blueprint.GridBlueprint;
 import com.aicivilization.entity.CitizenEntity;
 import com.aicivilization.entity.ModEntities;
 import com.aicivilization.profession.MinerJob;
@@ -24,7 +23,6 @@ import net.minecraft.core.particles.ParticleTypes;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.level.levelgen.Heightmap;
-import net.minecraft.tags.BlockTags;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.entity.BannerBlockEntity;
@@ -362,6 +360,10 @@ public class AICivilizationMod implements ModInitializer {
                 spawnPositions.get(index), center, level.dimension().location());
             citizen.setNation(nation.id(), nation.name());
         }
+        level.setBlockAndUpdate(center, standardFor(nation.name()).defaultBlockState());
+        BlockEntity bannerEntity = level.getBlockEntity(center);
+        if (bannerEntity instanceof BannerBlockEntity banner) banner.setChanged();
+
         boolean jobsStarted = citizens.get(0).startLumberjack()
             && citizens.get(1).startStorage()
             && citizens.get(2).startMiner()
@@ -373,7 +375,6 @@ public class AICivilizationMod implements ModInitializer {
             player.sendSystemMessage(ChatMessages.error("A civilização não pôde iniciar os quatro trabalhos; tente em outra área."));
             return 0;
         }
-        placeVillageCenterBlueprint(level, center, standardFor(nation.name()));
         citizens.getFirst().announce("Fundei " + nation.name() + "! Nossa equipe já está trabalhando.");
         player.sendSystemMessage(ChatMessages.success("Civilization " + nation.name() + " foi criada."));
         player.sendSystemMessage(ChatMessages.info(citizens.get(0).getPersonalName() + " foi criado como LumberJack."));
@@ -381,38 +382,6 @@ public class AICivilizationMod implements ModInitializer {
         player.sendSystemMessage(ChatMessages.info(citizens.get(2).getPersonalName() + " foi criado como Miner."));
         player.sendSystemMessage(ChatMessages.info(citizens.get(3).getPersonalName() + " foi criado como Builder."));
         return 1;
-    }
-
-    private void placeVillageCenterBlueprint(ServerLevel level, BlockPos center,
-                                             net.minecraft.world.level.block.Block standard) {
-        GridBlueprint blueprint = GridBlueprint.load(level, "village_center_7x5");
-        int floorY = center.getY() - 1;
-        for (int row = 0; row < blueprint.depth(); row++) {
-            for (int column = 0; column < blueprint.width(); column++) {
-                char cell = blueprint.cellAt(column, row);
-                if (cell != 'P' && cell != 'S') continue;
-                int x = center.getX() + column - blueprint.width() / 2;
-                int z = center.getZ() + row - blueprint.depth() / 2;
-                BlockPos floor = new BlockPos(x, floorY, z);
-                BlockPos above = floor.above();
-                if (!level.hasChunkAt(floor)) continue;
-                boolean naturalFloor = !level.getBlockState(floor).hasBlockEntity()
-                    && isNaturalPlazaGround(level.getBlockState(floor));
-                if (cell == 'S' && above.equals(center)) {
-                    if (naturalFloor) level.setBlockAndUpdate(floor, Blocks.OAK_PLANKS.defaultBlockState());
-                    level.setBlockAndUpdate(above, standard.defaultBlockState());
-                    BlockEntity bannerEntity = level.getBlockEntity(above);
-                    if (bannerEntity instanceof BannerBlockEntity banner) banner.setChanged();
-                } else if (naturalFloor && level.getBlockState(above).canBeReplaced()) {
-                    level.setBlockAndUpdate(floor, Blocks.OAK_PLANKS.defaultBlockState());
-                }
-            }
-        }
-    }
-
-    private boolean isNaturalPlazaGround(net.minecraft.world.level.block.state.BlockState state) {
-        return state.is(BlockTags.DIRT) || state.is(Blocks.GRASS_BLOCK) || state.is(Blocks.PODZOL)
-            || state.is(Blocks.MYCELIUM) || state.is(Blocks.MOSS_BLOCK);
     }
 
     private int deleteCivilization(ServerPlayer player, String name) {

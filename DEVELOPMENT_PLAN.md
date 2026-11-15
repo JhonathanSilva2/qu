@@ -89,7 +89,7 @@ O repositório antigo é um bot Mineflayer para Minecraft 1.20.6, conectado ao s
 - [x] Mudas coletáveis são reconhecidas pela tag vanilla, incluindo espécies novas ou compatíveis que adotem essa tag.
 - [x] Inventário cheio interrompe o trabalho do lenhador após preservar os itens restantes no mundo.
 - [x] Blueprints em grade JSON carregados pelo mod: armazém 10x10 com a distribuição de baús definida e praça central 7x5 com estandarte no centro.
-- [x] Na criação da civilização, a praça aplica tábuas de carvalho sobre terreno natural no mesmo nível do centro; células sobre construções/blocos com entidade são preservadas.
+- [x] O Builder constrói gradualmente a praça 7x5 de tábuas em volta do estandarte; solicita 34 tábuas ao Storager e preserva células que não sejam terreno natural livre.
 - [x] Storager constrói baús nas células `A` do blueprint do armazém após o Builder preparar o terreno 10x10; as células `x` ficam como corredores/espaços vazios.
 - [x] O painel de pedidos do Storager abre pela tecla `K`, recebe a fila da nação pelo servidor e permite atualizar a lista; `/aiciv storage queue` continua disponível.
 - [x] Pedidos de ferramenta ficam abertos até o Storager levar o item ao cidadão; enquanto isso o cidadão aguarda e não retira a mesma ferramenta sozinho do baú.
@@ -116,7 +116,7 @@ O repositório antigo é um bot Mineflayer para Minecraft 1.20.6, conectado ao s
 - [ ] Invocar outro cidadão dentro dos 128 blocos e confirmar que ele entra na nação existente; invocar fora e confirmar novo país/estandarte.
 - [ ] Mandar cidadão seguir/juntar madeira até a borda e confirmar que ele não cruza para território vizinho.
 - [ ] Confirmar que o estandarte aparece no centro e continua depois de salvar/reabrir o mundo.
-- [ ] Criar uma civilização e confirmar a praça 7x5 de tábuas ao redor do estandarte; conferir que terreno não natural/construções próximos não foram substituídos.
+- [ ] Criar uma civilização e confirmar que só o estandarte aparece inicialmente; depois acompanhar o Builder construindo gradualmente a praça 7x5 com materiais entregues pelo Storager.
 - [ ] Salvar/reabrir mundo e confirmar persistência dos IDs de nação, inventário e locais.
 - [ ] Marcar local com `/aiciv location set base`, listar, mandar NPC com `/aiciv npc <nome|slot> go base` e confirmar chegada.
 - [ ] Testar viagem com obstáculo e dimensão diferente; avaliar as limitações da navegação.
@@ -211,7 +211,7 @@ O repositório antigo é um bot Mineflayer para Minecraft 1.20.6, conectado ao s
 | 2026-11-14 | 1.21.10 / Fabric Loader 0.18.0 | `compileJava` e `compileClientJava` após corrigir atributo de movimento e retomada de profissões | `BUILD SUCCESSFUL` com Fabric Loom 1.19.4. Ainda falta confirmar movimento e retomada no jogo. | Entrar no mundo salvo e verificar caminhada do Storager, Miner e lenhador. |
 | 2026-11-14 | 1.21.10 / Fabric Loader 0.18.0 | `remapJar` após diagnóstico de NPCs parados | `BUILD SUCCESSFUL`; JAR atualizado copiado para a pasta global `.minecraft/mods`. O log anterior confirmou que Miner retomou a profissão, mas aguardava picareta; a pasta do launcher estava sem o JAR do mod. | Reiniciar o TLauncher para carregar a nova build e observar Storager, Miner e lenhador. |
 | 2026-11-14 | 1.21.10 / Fabric Loader 0.18.0 | `build` após refatoração modular (`ProfessionJob`, `LumberjackJob`), correção de bugs (loop da mina, comandos `go`/`nation`, watchdog teleporte, banner substituível, flood no chat) | `BUILD SUCCESSFUL` gerando `ai-civilization-0.1.0.jar` (copiado para `~/.minecraft/mods`). | Testar novos comandos e comportamento modular no mundo. |
-| 2026-11-14 | 1.21.10 / Fabric Loader 0.18.0 | Blueprints JSON da warehouse 10x10, praça central 7x5 e painel de pedidos pela tecla `K` | `compileJava` e `compileClientJava` passaram. Layout e interface ainda precisam de teste dentro do Minecraft. | Conferir os dois layouts, a entrega de ferramentas e a tela de pedidos no jogo. |
+| 2026-11-14 | 1.21.10 / Fabric Loader 0.18.0 | Blueprints JSON da warehouse 10x10, praça central 7x5 e painel de pedidos pela tecla `K` | `compileJava` e `compileClientJava` passaram; no teste de `runClient`, abrir o painel com `K` causou `Can only blur once per frame` em `StorageQueueScreen.render`. | Corrigir a renderização, transferir a construção da praça ao Builder e aguardar nova aprovação de teste no jogo. |
 
 ## Regras de trabalho
 
