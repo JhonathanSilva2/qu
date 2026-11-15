@@ -25,24 +25,51 @@ import net.minecraft.world.level.levelgen.Heightmap;
 import net.minecraft.world.level.storage.ValueInput;
 import net.minecraft.world.level.storage.ValueOutput;
 
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Set;
 
-/** Builds and repairs three-block-wide dirt roads from the town center to its four borders. */
+
+/**
+ * Builds and maintains three-block-wide roads that all start at the town center:
+ * center -> warehouse, center -> mine entrance, and center -> the four borders.
+ * Every road "step" (the 3 lanes across the road) shares one single height; consecutive steps
+ * may only rise or drop by one block. Finished road cells are recorded in a ledger that is
+ * inspected a few cells per tick; damaged cells go to a repair queue that is serviced in short
+ * batches without taking the Builder away from construction for long.
+ */
 public final class BuilderJob implements ProfessionJob {
     public static final String ID = "builder";
     public static final String LABEL = "Builder";
     private static final int TICK_INTERVAL = 4;
-    private static final int ROAD_WIDTH = 3;
     private static final int[] LANE_OFFSETS = {-1, 0, 1};
     private static final Direction[] ROAD_DIRECTIONS = {Direction.EAST, Direction.SOUTH, Direction.WEST, Direction.NORTH};
+
+    // Route ids, in build priority order
+    private static final int ROUTE_WAREHOUSE = 0;
+    private static final int ROUTE_MINE = 1;
+    private static final int ROUTE_CARDINAL_FIRST = 2;
+    private static final int ROUTE_COUNT = 6;
+    private static final int UNSET_Y = Integer.MIN_VALUE;
+    private static final int HEADROOM = 3;
+    private static final int MAX_FILL_DEPTH = 4;
+    private static final int MAX_STEPS_CHECKED_PER_TICK = 8;
+
+    // Maintenance tuning
+    private static final int INSPECT_PER_TICK = 8;          // ledger cells verified per builder tick
+    private static final int REPAIR_EVERY_ACTIONS = 150;    // construction actions between routine repair batches
+    private static final int REPAIR_URGENT_QUEUE = 16;      // this many damaged cells interrupt construction
+    private static final double REPAIR_NEARBY_SQR = 144.0;  // damage within 12 blocks is fixed right away
+    private static final double REPAIR_CLUSTER_SQR = 64.0;  // a batch keeps fixing cells within 8 blocks
+    private static final int REPAIR_MAX_ATTEMPTS = 40;
+
     private static GridBlueprint VILLAGE_CENTER_BLUEPRINT;
     private int cooldown;
     private BlockPos townCenter;
-    private int directionIndex;
-    private int distance = 1;
-    private int laneIndex;
     private int warehousePlotCursor;
     private int plazaCursor;
-    private int[] previousSurfaceY = new int[ROAD_WIDTH];
     private String pendingResourceId = "";
     private boolean shovelRequestSent;
     private boolean pickaxeRequestSent;
@@ -51,9 +78,26 @@ public final class BuilderJob implements ProfessionJob {
     private BlockPos dirtSourceTarget;
     private boolean completed;
     private boolean preparingPlot;
-    private boolean warehousePathDone;
-    private int warehousePathStep;
-    private int warehousePathLane;
+
+    // Road construction progress
+    private int routeIndex;
+    private int routeStep;
+    private int routeY = UNSET_Y;
+    private int stepTargetY = UNSET_Y;
+    private int routeDoneMask;
+    private BlockPos mineRouteOrigin;
+
+    // Road maintenance
+    private final List<BlockPos> roadLedger = new ArrayList<>();
+    private final Set<BlockPos> roadLedgerSet = new HashSet<>();
+    private final LinkedHashSet<BlockPos> repairQueue = new LinkedHashSet<>();
+    private int inspectCursor;
+    private int actionsSinceRepair;
+    private BlockPos repairTarget;
+    private int repairAttempts;
+    private String currentSubTask = "Iniciando";
+    private int reforestationCursor;
+    private boolean reforestationDone;
 
     private boolean gatheringDirtBatch;
     private int dirtBatchTargetCount;
@@ -87,7 +131,9 @@ public final class BuilderJob implements ProfessionJob {
     }
 
     @Override
-    public String workStatus(CitizenEntity citizen, ServerLevel level) { return workStatus(); }
+    public String workStatus(CitizenEntity citizen, ServerLevel level) {
+        return workStatusDetailed(citizen, level);
+    }
 
     @Override
     public String debugStatus(CitizenEntity citizen, ServerLevel level) { return debugStatus(); }
@@ -104,36 +150,57 @@ public final class BuilderJob implements ProfessionJob {
         if (warehouse != null && data.warehousePlotRequested(citizen.getNationId())
             && !data.warehousePlotPrepared(citizen.getNationId())) {
             if (dirtSourceTarget != null) {
-                return citizen.distanceToSqr(dirtSourceTarget.getX() + 0.5, dirtSourceTarget.getY(), dirtSourceTarget.getZ() + 0.5) > 9.0;
+                return horizDistSqr(citizen, dirtSourceTarget.getX() + 0.5, dirtSourceTarget.getZ() + 0.5) > 9.0;
             }
-            return citizen.distanceToSqr(warehouse.x() + 0.5, warehouse.y(), warehouse.z() + 0.5) > 49.0;
+            return horizDistSqr(citizen, warehouse.x() + 0.5, warehouse.z() + 0.5) > 49.0;
         }
         if (townCenter == null) return false;
-        if (plazaCursor < villageCenterBlueprint(level).width() * villageCenterBlueprint(level).depth()) {
-            return citizen.distanceToSqr(townCenter.getX() + 0.5, townCenter.getY(), townCenter.getZ() + 0.5) > 36.0;
+        if (plazaCursor < 100 && isPrimaryStructureBuilder(citizen, level)) {
+            return horizDistSqr(citizen, townCenter.getX() + 0.5, townCenter.getZ() + 0.5) > 36.0;
         }
-        if (warehouse != null && !warehousePathDone) {
-            java.util.List<BlockPos> cells = computeWarehouseConnectionCells(warehouse);
-            if (warehousePathStep < cells.size()) {
-                BlockPos next = cells.get(warehousePathStep);
-                int y = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, next.getX(), next.getZ());
-                return citizen.distanceToSqr(next.getX() + 0.5, y, next.getZ() + 0.5) > 16.0;
+        if (repairTarget != null) {
+            return horizDistSqr(citizen, repairTarget.getX() + 0.5, repairTarget.getZ() + 0.5) > 20.25;
+        }
+        if (routeIndex >= 0 && routeIndex < ROUTE_COUNT && !isRouteDone(routeIndex)) {
+            List<RoadStep> steps = computeRouteSteps(routeIndex, data, citizen, level);
+            if (routeStep >= 0 && routeStep < steps.size()) {
+                BlockPos center = steps.get(routeStep).center(0);
+                return horizDistSqr(citizen, center.getX() + 0.5, center.getZ() + 0.5) > 20.25;
             }
         }
-        if (completed || directionIndex >= ROAD_DIRECTIONS.length) return false;
-        BlockPos target = roadPosition(ROAD_DIRECTIONS[directionIndex], distance, LANE_OFFSETS[laneIndex]);
-        int y = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, target.getX(), target.getZ());
-        return citizen.distanceToSqr(target.getX() + 0.5, y, target.getZ() + 0.5) > 16.0;
+        return false;
+    }
+
+    /**
+     * When multiple Builders exist in the same nation, Builder #1 (lowest UUID) is the Primary Structure Builder
+     * (10x10 Village Center, 10x10 Warehouse plot, 50x50 NW Reforestation Zone smoothing), while Builder #2
+     * immediately builds the 15x3 Warehouse road, the "T" Mine road, and the 4 cardinal roads.
+     * If only 1 Builder exists, it performs all tasks sequentially.
+     */
+    private boolean isPrimaryStructureBuilder(CitizenEntity citizen, ServerLevel level) {
+        if (citizen.getNationId() == null) return true;
+        java.util.UUID myId = citizen.getUUID();
+        for (Entity entity : level.getAllEntities()) {
+            if (entity instanceof CitizenEntity other && other != citizen
+                && citizen.getNationId().equals(other.getNationId()) && other.isBuilderEnabled()) {
+                if (other.getUUID().compareTo(myId) < 0) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    private static double horizDistSqr(CitizenEntity citizen, double targetX, double targetZ) {
+        double dx = citizen.getX() - targetX;
+        double dz = citizen.getZ() - targetZ;
+        return dx * dx + dz * dz;
     }
 
     public void start(CitizenEntity citizen, BlockPos center) {
         townCenter = center.immutable();
-        directionIndex = 0;
-        distance = 1;
-        laneIndex = 0;
         warehousePlotCursor = 0;
         plazaCursor = 0;
-        previousSurfaceY = new int[ROAD_WIDTH];
         pendingResourceId = "";
         shovelRequestSent = false;
         pickaxeRequestSent = false;
@@ -142,9 +209,21 @@ public final class BuilderJob implements ProfessionJob {
         dirtSourceTarget = null;
         completed = false;
         preparingPlot = false;
-        warehousePathDone = false;
-        warehousePathStep = 0;
-        warehousePathLane = 0;
+        routeIndex = ROUTE_WAREHOUSE;
+        routeStep = 0;
+        routeY = UNSET_Y;
+        stepTargetY = UNSET_Y;
+        routeDoneMask = 0;
+        mineRouteOrigin = null;
+        roadLedger.clear();
+        roadLedgerSet.clear();
+        repairQueue.clear();
+        inspectCursor = 0;
+        actionsSinceRepair = 0;
+        repairTarget = null;
+        repairAttempts = 0;
+        reforestationCursor = 0;
+        reforestationDone = false;
         cooldown = 0;
     }
 
@@ -152,16 +231,13 @@ public final class BuilderJob implements ProfessionJob {
         townCenter = null;
         pendingResourceId = "";
         completed = false;
+        repairTarget = null;
     }
 
     public void save(ValueOutput output) {
         if (townCenter != null) output.store("BuilderCenter", BlockPos.CODEC, townCenter);
-        output.putInt("BuilderDirection", directionIndex);
-        output.putInt("BuilderDistance", distance);
-        output.putInt("BuilderLane", laneIndex);
         output.putInt("BuilderWarehousePlotCursor", warehousePlotCursor);
         output.putInt("BuilderPlazaCursor", plazaCursor);
-        output.putIntArray("BuilderPreviousSurfaceY", previousSurfaceY);
         output.putString("BuilderPendingResource", pendingResourceId);
         output.putBoolean("BuilderShovelRequestSent", shovelRequestSent);
         output.putBoolean("BuilderPickaxeRequestSent", pickaxeRequestSent);
@@ -169,18 +245,24 @@ public final class BuilderJob implements ProfessionJob {
         output.putBoolean("BuilderDirtSearchAnnounced", dirtSearchAnnounced);
         output.putBoolean("BuilderCompleted", completed);
         output.putBoolean("BuilderPreparingPlot", preparingPlot);
-        output.putBoolean("BuilderWarehousePathDone", warehousePathDone);
+        output.putInt("BuilderRouteIndex", routeIndex);
+        output.putInt("BuilderRouteStep", routeStep);
+        output.putInt("BuilderRouteY", routeY);
+        output.putInt("BuilderStepTargetY", stepTargetY);
+        output.putInt("BuilderRouteDoneMask", routeDoneMask);
+        if (mineRouteOrigin != null) output.store("BuilderMineRouteOrigin", BlockPos.CODEC, mineRouteOrigin);
+        output.store("BuilderRoadLedger", BlockPos.CODEC.listOf(), List.copyOf(roadLedger));
+        output.store("BuilderRepairQueue", BlockPos.CODEC.listOf(), List.copyOf(repairQueue));
+        output.putInt("BuilderInspectCursor", inspectCursor);
+        output.putInt("BuilderActionsSinceRepair", actionsSinceRepair);
+        output.putInt("BuilderReforestationCursor", reforestationCursor);
+        output.putBoolean("BuilderReforestationDone", reforestationDone);
     }
 
     public void load(ValueInput input) {
         townCenter = input.read("BuilderCenter", BlockPos.CODEC).orElse(null);
-        directionIndex = Math.max(0, Math.min(ROAD_DIRECTIONS.length - 1, input.getIntOr("BuilderDirection", 0)));
-        distance = Math.max(1, input.getIntOr("BuilderDistance", 1));
-        laneIndex = Math.max(0, Math.min(ROAD_WIDTH - 1, input.getIntOr("BuilderLane", 0)));
         warehousePlotCursor = Math.max(0, Math.min(100, input.getIntOr("BuilderWarehousePlotCursor", 0)));
-        plazaCursor = Math.max(0, Math.min(35, input.getIntOr("BuilderPlazaCursor", 0)));
-        previousSurfaceY = input.getIntArray("BuilderPreviousSurfaceY").filter(values -> values.length == ROAD_WIDTH)
-            .orElse(new int[ROAD_WIDTH]);
+        plazaCursor = Math.max(0, Math.min(100, input.getIntOr("BuilderPlazaCursor", 0)));
         pendingResourceId = input.getStringOr("BuilderPendingResource", "");
         shovelRequestSent = input.getBooleanOr("BuilderShovelRequestSent", false);
         pickaxeRequestSent = input.getBooleanOr("BuilderPickaxeRequestSent", false);
@@ -188,28 +270,111 @@ public final class BuilderJob implements ProfessionJob {
         dirtSearchAnnounced = input.getBooleanOr("BuilderDirtSearchAnnounced", false);
         completed = input.getBooleanOr("BuilderCompleted", false);
         preparingPlot = input.getBooleanOr("BuilderPreparingPlot", false);
-        warehousePathDone = input.getBooleanOr("BuilderWarehousePathDone", false);
+        routeIndex = Math.max(0, Math.min(ROUTE_COUNT, input.getIntOr("BuilderRouteIndex", ROUTE_WAREHOUSE)));
+        routeStep = Math.max(0, input.getIntOr("BuilderRouteStep", 0));
+        routeY = input.getIntOr("BuilderRouteY", UNSET_Y);
+        stepTargetY = input.getIntOr("BuilderStepTargetY", UNSET_Y);
+        routeDoneMask = input.getIntOr("BuilderRouteDoneMask", 0);
+        mineRouteOrigin = input.read("BuilderMineRouteOrigin", BlockPos.CODEC).orElse(null);
+        roadLedger.clear();
+        roadLedgerSet.clear();
+        input.read("BuilderRoadLedger", BlockPos.CODEC.listOf()).ifPresent(saved -> {
+            for (BlockPos pos : saved) {
+                BlockPos imm = pos.immutable();
+                if (roadLedgerSet.add(imm)) roadLedger.add(imm);
+            }
+        });
+        repairQueue.clear();
+        input.read("BuilderRepairQueue", BlockPos.CODEC.listOf()).ifPresent(saved -> {
+            for (BlockPos pos : saved) repairQueue.add(pos.immutable());
+        });
+        inspectCursor = Math.max(0, input.getIntOr("BuilderInspectCursor", 0));
+        actionsSinceRepair = Math.max(0, input.getIntOr("BuilderActionsSinceRepair", 0));
+        reforestationCursor = Math.max(0, Math.min(2500, input.getIntOr("BuilderReforestationCursor", 0)));
+        reforestationDone = input.getBooleanOr("BuilderReforestationDone", false);
+        repairTarget = null;
+        repairAttempts = 0;
     }
 
     public boolean isActive() {
-        return townCenter != null && (!completed || plazaCursor < 35);
+        return townCenter != null && (!completed || plazaCursor < 100 || !repairQueue.isEmpty() || repairTarget != null);
     }
 
     public boolean isInitialized() { return townCenter != null; }
 
     public String workStatus() {
         if (townCenter == null) return "Planejando os caminhos da vila";
-        if (preparingPlot) return "Construindo piso 10x10 da warehouse: " + warehousePlotCursor + "%";
-        if (plazaCursor < 35) return "Construindo a praça de madeira do centro: " + plazaCursor + "/35";
-        if (!warehousePathDone) return "Conectando o caminho do centro da vila até a warehouse";
-        if (completed) return "Os quatro caminhos até as fronteiras estão prontos";
-        return "Construindo caminho " + directionName() + ", trecho " + distance + "/"
-            + CivilizationData.NATION_RADIUS_BLOCKS + ", faixa " + (laneIndex + 1) + "/" + ROAD_WIDTH;
+        if (preparingPlot) return "Construindo piso 10x10 da warehouse: " + warehousePlotCursor + "% — " + currentSubTask;
+        if (plazaCursor < 100) return "Construindo Centro da Vila 10x10: " + plazaCursor + "/100 — " + currentSubTask;
+        if (repairTarget != null) {
+            return "Reparando caminho em [" + repairTarget.toShortString() + "] (" + (repairQueue.size() + 1) + " pendente(s)) — " + currentSubTask;
+        }
+        if (completed) {
+            if (!reforestationDone) {
+                return "Terraplanando área de reflorestamento 50x50 (NO): " + (reforestationCursor * 100 / 2500) + "% — " + currentSubTask;
+            }
+            return repairQueue.isEmpty()
+                ? "Caminhos prontos; monitorando " + roadLedger.size() + " blocos"
+                : "Indo reparar " + repairQueue.size() + " bloco(s) do caminho";
+        }
+        return "Construindo caminho " + routeLabel(routeIndex) + " (passo " + (routeStep + 1) + ") — " + currentSubTask;
+    }
+
+    public String workStatusDetailed(CitizenEntity citizen, ServerLevel level) {
+        CivilizationData data = CivilizationData.get(level);
+        boolean primaryBuilder = isPrimaryStructureBuilder(citizen, level);
+        String waitDesc = StorageJob.describeOpenWaitRequest(citizen, level);
+        StringBuilder sb = new StringBuilder();
+        sb.append("Papel: ").append(primaryBuilder ? "Builder #1 (Estruturas 10x10 + Reflorestamento + Rotas)" : "Builder #2 (Estradas 3-largura + Manutenção)");
+        sb.append("\nFase: ").append(!waitDesc.isEmpty() ? waitDesc : workStatus());
+
+        if (townCenter != null && !preparingPlot && (plazaCursor >= 100 || !primaryBuilder) && !completed && routeIndex >= 0 && routeIndex < ROUTE_COUNT) {
+            List<RoadStep> steps = computeRouteSteps(routeIndex, data, citizen, level);
+            int total = steps.size();
+            int pct = total > 0 ? Math.min(100, (routeStep * 100) / total) : 100;
+            sb.append("\nProgresso da rota [").append(routeLabel(routeIndex)).append("]: ")
+                .append(routeStep).append("/").append(total).append(" passos (").append(pct).append("%)");
+            if (routeStep >= 0 && routeStep < total) {
+                RoadStep s = steps.get(routeStep);
+                int y = stepTargetY != UNSET_Y ? stepTargetY : (routeY != UNSET_Y ? routeY : townCenter.getY());
+                double dist = Math.sqrt(horizDistSqr(citizen, s.x() + 0.5, s.z() + 0.5));
+                sb.append(" | Alvo: [").append(s.x()).append(", ").append(y).append(", ").append(s.z())
+                    .append(String.format(java.util.Locale.ROOT, "] (%.1fm, 3 faixas niveladas em Y=%d)", dist, y));
+            }
+        }
+
+        // Route checklist summary
+        sb.append("\nRotas (centro da vila): ")
+            .append("Warehouse(15x3)=").append(isRouteDone(ROUTE_WAREHOUSE) ? "OK" : (routeIndex == ROUTE_WAREHOUSE ? "ATIVA" : "pendente"))
+            .append(" | Mina/Caverna(T)=").append(isRouteDone(ROUTE_MINE) ? "OK" : (routeIndex == ROUTE_MINE ? "ATIVA" : (data.getMineSite(citizen.getNationId()) == null ? "aguardando Miner" : "pendente")))
+            .append(" | L/S/O/N=")
+            .append(isRouteDone(ROUTE_CARDINAL_FIRST) ? "OK" : "pend").append("/")
+            .append(isRouteDone(ROUTE_CARDINAL_FIRST + 1) ? "OK" : "pend").append("/")
+            .append(isRouteDone(ROUTE_CARDINAL_FIRST + 2) ? "OK" : "pend").append("/")
+            .append(isRouteDone(ROUTE_CARDINAL_FIRST + 3) ? "OK" : "pend")
+            .append(" | Reflorestamento(50x50)=").append(reforestationDone ? "OK" : (reforestationCursor * 100 / 2500) + "%");
+
+        int dirtCount = countItem(citizen, Items.DIRT);
+        int planksCount = countTaggedItem(citizen, ItemTags.PLANKS);
+        int logsCount = countTaggedItem(citizen, ItemTags.LOGS);
+        sb.append("\nMateriais: ").append(dirtCount).append(" terra, ")
+            .append(planksCount).append(" tábuas, ").append(logsCount).append(" troncos")
+            .append(" | Manutenção: ").append(roadLedger.size()).append(" monitorados, ")
+            .append(repairQueue.size()).append(" na fila de reparo");
+
+        if (!waitDesc.isEmpty()) {
+            sb.append("\n").append(waitDesc);
+        }
+        return sb.toString();
     }
 
     public String debugStatus() {
-        return "active=" + isActive() + ", plot=" + warehousePlotCursor + "/100, plaza=" + plazaCursor + "/35, direction=" + directionName() + ", distance=" + distance
-            + ", lane=" + laneIndex + ", pending=" + pendingResourceId;
+        return "active=" + isActive() + ", plot=" + warehousePlotCursor + "/100, plaza=" + plazaCursor + "/100"
+            + ", route=" + routeLabel(routeIndex) + "#" + routeStep + ", y=" + stepTargetY
+            + ", reforest=" + reforestationCursor + "/2500"
+            + ", task=\"" + currentSubTask + "\""
+            + ", ledger=" + roadLedger.size() + ", repairs=" + repairQueue.size()
+            + ", pending=" + pendingResourceId;
     }
 
     public void tick(CitizenEntity citizen, ServerLevel level) {
@@ -221,7 +386,9 @@ public final class BuilderJob implements ProfessionJob {
         }
         CivilizationData data = CivilizationData.get(level);
         CivilizationData.Warehouse warehouse = data.warehouse(citizen.getNationId());
-        if (warehouse != null && data.warehousePlotRequested(citizen.getNationId())
+        boolean primaryStructureBuilder = isPrimaryStructureBuilder(citizen, level);
+
+        if (primaryStructureBuilder && warehouse != null && data.warehousePlotRequested(citizen.getNationId())
             && !data.warehousePlotPrepared(citizen.getNationId())) {
             if (!preparingPlot && warehousePlotCursor >= 100) warehousePlotCursor = 0;
             preparingPlot = true;
@@ -231,164 +398,755 @@ public final class BuilderJob implements ProfessionJob {
             prepareWarehousePlot(citizen, level, warehouse);
             return;
         }
-        if (warehouse == null || data.warehousePlotPrepared(citizen.getNationId())) preparingPlot = false;
+        if (!primaryStructureBuilder || warehouse == null || data.warehousePlotPrepared(citizen.getNationId())) {
+            preparingPlot = false;
+        }
         if (cooldown-- > 0) return;
         cooldown = TICK_INTERVAL;
         collectNearbyDrops(citizen, level);
-        if (plazaCursor < 35) {
+
+        // Architectural gate: while waiting for a requested resource from the Warehouse,
+        // do NOT run any construction, maintenance, or reforestation logic that could override navigation.
+        if (handlePendingWarehouseResource(citizen, level, data)) {
+            return;
+        }
+
+        // Background road inspection: checks a few ledger cells per tick (O(1) cost).
+        inspectRoadLedger(citizen, level, warehouse);
+
+        if (primaryStructureBuilder && plazaCursor < 100) {
             buildVillageCenter(citizen, level);
             return;
-        }
-        if (warehouse != null && !warehousePathDone) {
-            buildWarehouseConnectionRoad(citizen, level, warehouse);
-            return;
-        }
-        if (completed) return;
-        if (directionIndex >= ROAD_DIRECTIONS.length) {
-            completed = true;
-            citizen.announce("Concluí e revisei os caminhos nas quatro direções da vila.");
-            return;
+        } else if (!primaryStructureBuilder && plazaCursor < 100) {
+            plazaCursor = 100; // Secondary builder skips Plaza 10x10 and starts roads immediately!
         }
 
-        Direction direction = ROAD_DIRECTIONS[directionIndex];
-        BlockPos target = roadPosition(direction, distance, LANE_OFFSETS[laneIndex]);
-        if (!citizen.isInsideNation(target)) {
-            advanceLane();
-            return;
-        }
-        if (!level.hasChunkAt(target)) return;
-
-        // Skip cells that are inside the 7x5 village center plaza or the 10x10 warehouse plot
-        if (isInsidePlazaOrWarehouse(target, warehouse)) {
-            previousSurfaceY[laneIndex] = getTrueRoadSurfaceY(level, target.getX(), target.getZ());
-            advanceLane();
-            return;
-        }
-
-        int surfaceY = getTrueRoadSurfaceY(level, target.getX(), target.getZ());
-        int prevY = previousSurfaceY[laneIndex] == 0 ? townCenter.getY() : previousSurfaceY[laneIndex];
-
-        // Millénaire-style slope smoothing: never allow the road to jump or drop by more than 1 block per step!
-        int desiredSurfaceY = surfaceY;
-        if (surfaceY - prevY > 1) {
-            desiredSurfaceY = prevY + 1;
-        } else if (prevY - surfaceY > 1) {
-            desiredSurfaceY = prevY - 1;
-        }
-
-        BlockPos surface = new BlockPos(target.getX(), surfaceY, target.getZ());
-        double horizDistSqr = citizen.distanceToSqr(target.getX() + 0.5, citizen.getY(), target.getZ() + 0.5);
-        if (horizDistSqr > 25.0) {
-            if (citizen.getNavigation().isDone())
-                citizen.getNavigation().moveTo(surface.getX() + 0.5, prevY, surface.getZ() + 0.5, 0.95);
-            return;
-        }
-
-        // Check a 1-block radius around the road cell (from desiredSurfaceY - 1 up to surfaceY + 4) for any tree logs or mushrooms!
-        for (int dx = -1; dx <= 1; dx++) {
-            for (int dz = -1; dz <= 1; dz++) {
-                for (int checkY = Math.min(desiredSurfaceY - 1, surfaceY - 1); checkY <= Math.max(surfaceY, desiredSurfaceY) + 4; checkY++) {
-                    BlockPos checkPos = new BlockPos(target.getX() + dx, checkY, target.getZ() + dz);
-                    if (!citizen.isInsideNation(checkPos) || !level.hasChunkAt(checkPos)) continue;
-                    BlockState checkState = level.getBlockState(checkPos);
-                    if (checkState.is(BlockTags.LOGS) || isMushroomBlock(checkState)) {
-                        clearConnectedTreeInPlot(citizen, level, checkPos);
-                        collectNearbyDrops(citizen, level);
-                        return;
-                    }
-                }
+        // Primary structure builder smooths the 50x50 NW Reforestation Zone once Plaza & Warehouse are done
+        if (primaryStructureBuilder && !reforestationDone
+            && (warehouse == null || data.warehousePlotPrepared(citizen.getNationId()))) {
+            if (prepareReforestationZoneStep(citizen, level, data)) {
+                return;
             }
         }
 
-        BlockPos ground = surface.below();
-        BlockState groundState = level.getBlockState(ground);
+        // If a warehouse or mine appeared after we skipped its route, re-open that route.
+        refreshDynamicRoutes(data, citizen, level);
 
-        // Sweep any foliage/flowers/leaves/leaf litter at or above the road so the Builder has a 4-block-high tunnel of air!
-        for (int clearY = desiredSurfaceY; clearY <= Math.max(surfaceY, desiredSurfaceY) + 4; clearY++) {
-            BlockPos clearPos = new BlockPos(target.getX(), clearY, target.getZ());
+        // Urgent/nearby maintenance or maintenance window between construction batches.
+        if (shouldRunMaintenanceNow(citizen)) {
+            if (tickMaintenance(citizen, level, warehouse)) return;
+        }
+
+        int currentRoute = selectNextActiveRoute(data, citizen, level);
+        if (currentRoute < 0) {
+            if (!completed) {
+                completed = true;
+                citizen.announce("Concluí os caminhos nivelados da vila (centro, warehouse, mina e fronteiras).");
+            }
+            if (!reforestationDone && prepareReforestationZoneStep(citizen, level, data)) {
+                return;
+            }
+            if (!repairQueue.isEmpty() || repairTarget != null) {
+                tickMaintenance(citizen, level, warehouse);
+            }
+            return;
+        }
+        completed = false;
+        if (currentRoute != routeIndex) {
+            routeIndex = currentRoute;
+            routeStep = 0;
+            routeY = UNSET_Y;
+            stepTargetY = UNSET_Y;
+        }
+
+        buildRoadRouteStep(citizen, level, data, warehouse);
+    }
+
+    /**
+     * Builds the active route one 3-block-wide step at a time.
+     * All 3 lanes of a step are forced to the exact same Y (stepTargetY), which can differ by at most
+     * +-1 from the previous step's Y (routeY). This allows the road to climb hills and descend valleys
+     * while keeping the 3-block width completely flat and aligned.
+     */
+    private void buildRoadRouteStep(CitizenEntity citizen, ServerLevel level, CivilizationData data,
+                                    CivilizationData.Warehouse warehouse) {
+        List<RoadStep> steps = computeRouteSteps(routeIndex, data, citizen, level);
+        if (steps.isEmpty()) {
+            markRouteDone(routeIndex);
+            return;
+        }
+
+        int skippedThisTick = 0;
+        while (routeStep < steps.size() && skippedThisTick < MAX_STEPS_CHECKED_PER_TICK) {
+            RoadStep step = steps.get(routeStep);
+            BlockPos stepCenter = step.center(townCenter.getY());
+            if (!citizen.isInsideNation(stepCenter)) {
+                advanceRouteStep(stepTargetY != UNSET_Y ? stepTargetY : routeY);
+                skippedThisTick++;
+                continue;
+            }
+            if (!level.hasChunkAt(stepCenter)) return;
+
+            boolean allReserved = true;
+            for (int i = 0; i < LANE_OFFSETS.length; i++) {
+                BlockPos col = step.lanePos(LANE_OFFSETS[i], townCenter.getY());
+                if (citizen.isInsideNation(col) && !isInsidePlazaOrWarehouse(col, warehouse)) {
+                    allReserved = false;
+                    break;
+                }
+            }
+            if (allReserved) {
+                int anchorY = sampleStepTerrainY(level, step, warehouse);
+                advanceRouteStep(anchorY);
+                skippedThisTick++;
+                continue;
+            }
+
+            if (stepTargetY == UNSET_Y) {
+                stepTargetY = computeUnifiedStepY(level, step, warehouse);
+            }
+            final int targetY = stepTargetY;
+
+            // Walk close enough to the step center so all 3 lanes are within reach.
+            // IMPORTANT: Always use 2D horizontal distance (horizDistSqr) and actual terrain height for navigation!
+            BlockPos navCenter = step.center(targetY);
+            double hDistSqr = horizDistSqr(citizen, navCenter.getX() + 0.5, navCenter.getZ() + 0.5);
+            if (hDistSqr > 20.25) {
+                int walkY = getTrueRoadSurfaceY(level, navCenter.getX(), navCenter.getZ());
+                currentSubTask = String.format(java.util.Locale.ROOT, "Caminhando até o passo %d [%.1fm]", routeStep + 1, Math.sqrt(hDistSqr));
+                CitizenEntity.moveTowards(citizen, level, navCenter.getX() + 0.5, walkY, navCenter.getZ() + 0.5, 1.0);
+                return;
+            }
+            citizen.getNavigation().stop();
+
+            // 1. Clear any trees or giant mushrooms overlapping this 3-wide step before shaping terrain.
+            for (int i = 0; i < LANE_OFFSETS.length; i++) {
+                BlockPos col = step.lanePos(LANE_OFFSETS[i], targetY);
+                if (!citizen.isInsideNation(col) || !level.hasChunkAt(col) || isInsidePlazaOrWarehouse(col, warehouse)) continue;
+                int rawY = getTrueRoadSurfaceY(level, col.getX(), col.getZ());
+                int minY = Math.min(targetY - 1, rawY - 1);
+                int maxY = Math.max(targetY, rawY) + HEADROOM + 1;
+                for (int dx = -1; dx <= 1; dx++) {
+                    for (int dz = -1; dz <= 1; dz++) {
+                        for (int checkY = minY; checkY <= maxY; checkY++) {
+                            BlockPos checkPos = new BlockPos(col.getX() + dx, checkY, col.getZ() + dz);
+                            if (!citizen.isInsideNation(checkPos) || !level.hasChunkAt(checkPos)) continue;
+                            BlockState checkState = level.getBlockState(checkPos);
+                            if (checkState.is(BlockTags.LOGS) || isMushroomBlock(checkState)) {
+                                currentSubTask = "Cortando árvore no traçado [" + checkPos.toShortString() + "]";
+                                clearConnectedTreeInPlot(citizen, level, checkPos);
+                                collectNearbyDrops(citizen, level);
+                                actionsSinceRepair++;
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 2. Millénaire-style 3-phase road step construction across all 3 lanes:
+            //    Phase 1: Cut any elevated blocks above targetY across all 3 lanes (harvesting dirt into inventory).
+            //    Phase 2: Fill foundations and level all 3 lanes to targetY - 1.
+            //    Phase 3: Pave all 3 lanes at targetY - 1 (DIRT_PATH or wood bridge over water).
+            for (int laneIdx = 0; laneIdx < LANE_OFFSETS.length; laneIdx++) {
+                BlockPos laneSurface = step.lanePos(LANE_OFFSETS[laneIdx], targetY);
+                if (!citizen.isInsideNation(laneSurface) || isInsidePlazaOrWarehouse(laneSurface, warehouse)) continue;
+                if (!level.hasChunkAt(laneSurface)) return;
+
+                CellOutcome outcome = shapeAndPaveRoadCell(citizen, level, laneSurface, laneIdx == 1);
+                if (outcome == CellOutcome.WORK_DONE) {
+                    actionsSinceRepair++;
+                    return;
+                }
+                if (outcome == CellOutcome.WAITING_RESOURCE) {
+                    return;
+                }
+                // CellOutcome.READY -> register in maintenance ledger and check next lane in the same tick.
+                recordRoadCell(laneSurface.below());
+            }
+
+            // All 3 lanes of this step are at the same height and paved!
+            currentSubTask = "Passo " + (routeStep + 1) + " nivelado (3 faixas em Y=" + targetY + ")";
+            advanceRouteStep(targetY);
+            skippedThisTick++;
+        }
+
+        if (routeStep >= steps.size()) {
+            finishCurrentRoute(citizen);
+        }
+    }
+
+    /**
+     * Shapes one road column so its walking air is at {@code surface.getY()} and its floor block
+     * at {@code surface.below()} is paved (DIRT_PATH on land, PLANKS over water), then registers it.
+     */
+    private CellOutcome shapeAndPaveRoadCell(CitizenEntity citizen, ServerLevel level, BlockPos surface, boolean centerLane) {
+        int x = surface.getX();
+        int z = surface.getZ();
+        int targetY = surface.getY();
+        BlockPos ground = surface.below();
+
+        // Sweep light vegetation in the headroom tunnel right away.
+        int currentTopY = getTrueRoadSurfaceY(level, x, z);
+        int sweepTop = Math.max(targetY + HEADROOM, currentTopY + 2);
+        for (int clearY = targetY; clearY <= sweepTop; clearY++) {
+            BlockPos clearPos = new BlockPos(x, clearY, z);
             BlockState clearState = level.getBlockState(clearPos);
             if (!clearState.isAir() && isClearableVegetation(clearState) && level.getFluidState(clearPos).isEmpty()) {
                 level.destroyBlock(clearPos, true, citizen);
             }
         }
 
-        // If terrain is too high (cliff > 1 block step up), cut it down and collect dirt!
-        if (surfaceY > desiredSurfaceY && level.getFluidState(ground).isEmpty()) {
-            if (!groundState.hasBlockEntity() && groundState.getDestroySpeed(level, ground) >= 0.0f) {
-                boolean isDirtLike = groundState.is(BlockTags.DIRT) || groundState.is(Blocks.GRASS_BLOCK);
-                if (level.destroyBlock(ground, !isDirtLike, citizen)) {
-                    if (isDirtLike) citizen.getNpcInventory().addItem(new ItemStack(Items.DIRT, 1));
+        // A) Cut down any solid obstacle in the headroom [targetY .. sweepTop] from top to bottom.
+        for (int cutY = sweepTop; cutY >= targetY; cutY--) {
+            BlockPos cutPos = new BlockPos(x, cutY, z);
+            BlockState cutState = level.getBlockState(cutPos);
+            if (cutState.isAir() || !level.getFluidState(cutPos).isEmpty()) continue;
+            if (isClearableVegetation(cutState)) {
+                level.destroyBlock(cutPos, true, citizen);
+                continue;
+            }
+            if (cutState.hasBlockEntity() || cutState.getDestroySpeed(level, cutPos) < 0.0f) {
+                break; // Unbreakable/container obstacle: leave it alone.
+            }
+            boolean stone = isExposedStone(cutState);
+            currentSubTask = "Escavando elevação em [" + cutPos.toShortString() + "] para nivelar em Y=" + targetY;
+            if (stone) {
+                if (!equipPickaxeForRoad(citizen, level)) {
+                    // Self-sufficient fallback: don't abandon the road if Warehouse has no pickaxe yet
+                    citizen.setItemSlot(EquipmentSlot.MAINHAND, new ItemStack(Items.WOODEN_PICKAXE));
                 }
-                return;
-            }
-        }
-
-        // If terrain is too low (drop > 1 block step down), fill it up so the road slopes smoothly!
-        if (surfaceY < desiredSurfaceY && !isWater(level, ground)) {
-            BlockPos fillPos = new BlockPos(target.getX(), surfaceY, target.getZ());
-            if (countItem(citizen, Items.DIRT) > 0) {
-                placeBlockFromInventory(citizen, level, fillPos, Blocks.DIRT.defaultBlockState(), Items.DIRT);
             } else {
-                level.setBlockAndUpdate(fillPos, Blocks.DIRT.defaultBlockState());
+                equipShovelForRoad(citizen, level);
             }
-            return;
+
+            citizen.getLookControl().setLookAt(cutPos.getX() + 0.5, cutPos.getY() + 0.5, cutPos.getZ() + 0.5);
+            citizen.swing(net.minecraft.world.InteractionHand.MAIN_HAND);
+            boolean isDirtLike = cutState.is(BlockTags.DIRT) || cutState.is(Blocks.GRASS_BLOCK);
+            if (level.destroyBlock(cutPos, !isDirtLike, citizen)) {
+                if (isDirtLike) citizen.getNpcInventory().addItem(new ItemStack(Items.DIRT, 1));
+                if (citizen.getMainHandItem().isDamageableItem()) {
+                    citizen.getMainHandItem().hurtAndBreak(1, citizen, EquipmentSlot.MAINHAND);
+                }
+                collectNearbyDrops(citizen, level);
+            }
+            return CellOutcome.WORK_DONE;
         }
 
-        surface = new BlockPos(target.getX(), desiredSurfaceY, target.getZ());
-        ground = surface.below();
+        // B) Water bridge when the column is over water.
+        BlockState groundState = level.getBlockState(ground);
+        if (isWater(level, ground) || isWater(level, surface)) {
+            if (groundState.is(BlockTags.PLANKS) && isClearHeadroom(level, surface)) {
+                return CellOutcome.READY;
+            }
+            currentSubTask = "Construindo ponte sobre água em [" + ground.toShortString() + "]";
+            return buildBridgeAt(citizen, level, ground, centerLane);
+        }
+
+        // C) Fill any air/replaceable gap below the road floor so the 3 lanes sit on a solid embankment.
+        int fillStart = Math.max(level.getMinY() + 5, ground.getY() - MAX_FILL_DEPTH);
+        for (int fillY = fillStart; fillY < ground.getY(); fillY++) {
+            BlockPos underPos = new BlockPos(x, fillY, z);
+            BlockState underState = level.getBlockState(underPos);
+            if (isWater(level, underPos)) continue;
+            if (underState.isAir() || underState.canBeReplaced() || isClearableVegetation(underState)) {
+                currentSubTask = "Aterrando base do caminho em [" + underPos.toShortString() + "]";
+                if (!underState.isAir() && isClearableVegetation(underState)) {
+                    level.destroyBlock(underPos, true, citizen);
+                }
+                if (citizen.getBoundingBox().intersects(new net.minecraft.world.phys.AABB(underPos))) {
+                    citizen.teleportTo(citizen.getX(), citizen.getY() + 1.0, citizen.getZ());
+                }
+                if (countItem(citizen, Items.DIRT) > 0) {
+                    placeBlockFromInventory(citizen, level, underPos, Blocks.DIRT.defaultBlockState(), Items.DIRT);
+                } else {
+                    level.setBlockAndUpdate(underPos, Blocks.DIRT.defaultBlockState());
+                }
+                return CellOutcome.WORK_DONE;
+            }
+        }
+
+        // D) Ensure the floor block at ground (targetY - 1) is a finished road block.
         groundState = level.getBlockState(ground);
-
-        if (groundState.is(Blocks.DIRT_PATH) || groundState.is(BlockTags.PLANKS) || groundState.is(BlockTags.STAIRS)) {
-            previousSurfaceY[laneIndex] = desiredSurfaceY;
-            advanceLane();
-            return;
+        if (isValidRoadFloor(groundState)) {
+            return CellOutcome.READY;
         }
 
-        if (isWater(level, ground)) {
-            buildBridgeCell(citizen, level, surface, direction);
-            return;
+        if (groundState.hasBlockEntity()) {
+            return CellOutcome.READY;
+        }
+
+        // If ground is air/replaceable (side lane was lower than center lane), fill it with dirt then path it.
+        if (groundState.isAir() || groundState.canBeReplaced() || isClearableVegetation(groundState)) {
+            currentSubTask = "Nivelando e pavimentando faixa em [" + ground.toShortString() + "]";
+            if (!groundState.isAir() && isClearableVegetation(groundState)) {
+                level.destroyBlock(ground, true, citizen);
+            }
+            if (!equipShovelForRoad(citizen, level)) {
+                citizen.setItemSlot(EquipmentSlot.MAINHAND, new ItemStack(Items.WOODEN_SHOVEL));
+            }
+            if (citizen.getBoundingBox().intersects(new net.minecraft.world.phys.AABB(ground))) {
+                citizen.teleportTo(citizen.getX(), citizen.getY() + 1.0, citizen.getZ());
+            }
+            citizen.getLookControl().setLookAt(ground.getX() + 0.5, ground.getY() + 0.5, ground.getZ() + 0.5);
+            citizen.swing(net.minecraft.world.InteractionHand.MAIN_HAND);
+            if (countItem(citizen, Items.DIRT) > 0) {
+                placeBlockFromInventory(citizen, level, ground, Blocks.DIRT.defaultBlockState(), Items.DIRT);
+            } else {
+                level.setBlockAndUpdate(ground, Blocks.DIRT.defaultBlockState());
+            }
+            level.setBlockAndUpdate(ground, Blocks.DIRT_PATH.defaultBlockState());
+            if (citizen.getMainHandItem().isDamageableItem()) {
+                citizen.getMainHandItem().hurtAndBreak(1, citizen, EquipmentSlot.MAINHAND);
+            }
+            return CellOutcome.WORK_DONE;
         }
 
         if (isExposedStone(groundState)) {
-            if (!equipPickaxe(citizen, level)) return;
+            currentSubTask = "Trocando pedra por caminho em [" + ground.toShortString() + "]";
+            if (!equipPickaxeForRoad(citizen, level)) {
+                citizen.setItemSlot(EquipmentSlot.MAINHAND, new ItemStack(Items.WOODEN_PICKAXE));
+            }
+            citizen.getLookControl().setLookAt(ground.getX() + 0.5, ground.getY() + 0.5, ground.getZ() + 0.5);
             citizen.swing(net.minecraft.world.InteractionHand.MAIN_HAND);
             if (level.destroyBlock(ground, true, citizen)) {
                 level.setBlockAndUpdate(ground, Blocks.DIRT_PATH.defaultBlockState());
                 if (citizen.getMainHandItem().isDamageableItem()) {
                     citizen.getMainHandItem().hurtAndBreak(1, citizen, EquipmentSlot.MAINHAND);
                 }
-                previousSurfaceY[laneIndex] = desiredSurfaceY;
-                advanceLane();
             }
-            return;
+            return CellOutcome.WORK_DONE;
         }
 
         if (!groundState.isFaceSturdy(level, ground, Direction.UP)) {
             level.setBlockAndUpdate(ground, Blocks.DIRT.defaultBlockState());
         }
-        if (!equipShovel(citizen, level)) return;
-
-        if (!level.getBlockState(surface).isAir() && !level.getBlockState(surface).canBeReplaced()) {
-            BlockState obstacle = level.getBlockState(surface);
-            if (isClearableVegetation(obstacle)) {
-                level.destroyBlock(surface, true, citizen);
-            } else {
-                previousSurfaceY[laneIndex] = desiredSurfaceY;
-                advanceLane();
-                return;
-            }
+        currentSubTask = "Compactando terra (Dirt Path) em [" + ground.toShortString() + "]";
+        if (!equipShovelForRoad(citizen, level)) {
+            citizen.setItemSlot(EquipmentSlot.MAINHAND, new ItemStack(Items.WOODEN_SHOVEL));
         }
         citizen.getLookControl().setLookAt(surface.getX() + 0.5, surface.getY(), surface.getZ() + 0.5);
         citizen.swing(net.minecraft.world.InteractionHand.MAIN_HAND);
         if (level.setBlockAndUpdate(ground, Blocks.DIRT_PATH.defaultBlockState())) {
-            if (!level.getBlockState(surface).isAir() && isClearableVegetation(level.getBlockState(surface))) {
-                level.destroyBlock(surface, true, citizen);
-            }
             if (citizen.getMainHandItem().isDamageableItem()) {
                 citizen.getMainHandItem().hurtAndBreak(1, citizen, EquipmentSlot.MAINHAND);
             }
-            previousSurfaceY[laneIndex] = desiredSurfaceY;
-            advanceLane();
+        }
+        return CellOutcome.WORK_DONE;
+    }
+
+    /**
+     * Equips a shovel from inventory if available; if none is in inventory, requests an upgrade from
+     * the Storager in the background WITHOUT forcing the Builder to walk back to the Warehouse mid-road.
+     */
+    private boolean equipShovelForRoad(CitizenEntity citizen, ServerLevel level) {
+        if (citizen.getMainHandItem().is(ItemTags.SHOVELS)) return true;
+        int slot = findInventorySlot(citizen, ItemTags.SHOVELS);
+        if (slot >= 0) {
+            ItemStack oldHand = citizen.getMainHandItem().copy();
+            if (!oldHand.isEmpty() && !citizen.getNpcInventory().canAddItem(oldHand)) return false;
+            ItemStack shovel = citizen.getNpcInventory().removeItem(slot, 1);
+            if (!oldHand.isEmpty()) citizen.getNpcInventory().addItem(oldHand);
+            citizen.setItemSlot(EquipmentSlot.MAINHAND, shovel);
+            shovelRequestSent = false;
+            return true;
+        }
+        return false;
+    }
+
+    private boolean equipPickaxeForRoad(CitizenEntity citizen, ServerLevel level) {
+        if (citizen.getMainHandItem().is(ItemTags.PICKAXES)) return true;
+        int slot = findInventorySlot(citizen, ItemTags.PICKAXES);
+        if (slot >= 0) {
+            ItemStack oldHand = citizen.getMainHandItem().copy();
+            if (!oldHand.isEmpty() && !citizen.getNpcInventory().canAddItem(oldHand)) return false;
+            ItemStack pickaxe = citizen.getNpcInventory().removeItem(slot, 1);
+            if (!oldHand.isEmpty()) citizen.getNpcInventory().addItem(oldHand);
+            citizen.setItemSlot(EquipmentSlot.MAINHAND, pickaxe);
+            pickaxeRequestSent = false;
+            return true;
+        }
+        return false;
+    }
+
+    private CellOutcome buildBridgeAt(CitizenEntity citizen, ServerLevel level, BlockPos floorPos, boolean supportBelow) {
+        convertOwnLogsToPlanks(citizen);
+        Item plank = findInventoryItem(citizen, ItemTags.PLANKS);
+        if (plank == null) {
+            if (!ensureResource(citizen, level, Items.OAK_PLANKS, 1, 16)) return CellOutcome.WAITING_RESOURCE;
+            plank = findInventoryItem(citizen, ItemTags.PLANKS);
+            if (plank == null) return CellOutcome.WAITING_RESOURCE;
+        }
+        pendingResourceId = "";
+        Block block = Block.byItem(plank);
+        if (block == Blocks.AIR) return CellOutcome.WAITING_RESOURCE;
+        citizen.getLookControl().setLookAt(floorPos.getX() + 0.5, floorPos.getY() + 0.5, floorPos.getZ() + 0.5);
+        citizen.swing(net.minecraft.world.InteractionHand.MAIN_HAND);
+        if (!level.setBlockAndUpdate(floorPos, block.defaultBlockState())) return CellOutcome.READY;
+        consumeItem(citizen, plank);
+        if (supportBelow) {
+            supportBridgeColumn(citizen, level, floorPos, plank);
+        }
+        return CellOutcome.WORK_DONE;
+    }
+
+    private void supportBridgeColumn(CitizenEntity citizen, ServerLevel level, BlockPos deck, Item plank) {
+        BlockPos support = deck.below();
+        int depth = 0;
+        while (depth < 6 && level.hasChunkAt(support) && level.getFluidState(support).is(FluidTags.WATER)) {
+            if (!consumeItem(citizen, plank)) return;
+            level.setBlockAndUpdate(support, Block.byItem(plank).defaultBlockState());
+            support = support.below();
+            depth++;
+        }
+    }
+
+    /**
+     * Computes one single surface Y for all 3 lanes of {@code step}.
+     * Uses the median of the 3 lanes' terrain heights, then clamps to [prevY - 1, prevY + 1]
+     * so the road rises or falls smoothly by at most 1 block per step while staying flat across its width.
+     */
+    private int computeUnifiedStepY(ServerLevel level, RoadStep step, CivilizationData.Warehouse warehouse) {
+        int rawY = sampleStepTerrainY(level, step, warehouse);
+        int prevY = routeY == UNSET_Y ? townCenter.getY() : routeY;
+        if (rawY > prevY + 1) return prevY + 1;
+        if (rawY < prevY - 1) return prevY - 1;
+        return rawY;
+    }
+
+    private int sampleStepTerrainY(ServerLevel level, RoadStep step, CivilizationData.Warehouse warehouse) {
+        // Only lock onto the CENTER lane (offset 0) if it is already paved, so perpendicular side-lane crossings
+        // near the town center don't pull the new road to a different Y.
+        int refY = routeY == UNSET_Y ? townCenter.getY() : routeY;
+        BlockPos centerCol = step.lanePos(0, refY);
+        if (level.hasChunkAt(centerCol)) {
+            for (int dy = -1; dy <= 1; dy++) {
+                BlockPos candidateFloor = new BlockPos(centerCol.getX(), refY - 1 + dy, centerCol.getZ());
+                if (isValidRoadFloor(level.getBlockState(candidateFloor))) {
+                    return candidateFloor.getY() + 1;
+                }
+            }
+        }
+
+        int[] samples = new int[LANE_OFFSETS.length];
+        int count = 0;
+        for (int offset : LANE_OFFSETS) {
+            BlockPos col = step.lanePos(offset, refY);
+            if (!level.hasChunkAt(col)) continue;
+            if (townCenter != null && col.getX() >= townCenter.getX() - 5 && col.getX() < townCenter.getX() + 5
+                && col.getZ() >= townCenter.getZ() - 5 && col.getZ() < townCenter.getZ() + 5) {
+                samples[count++] = townCenter.getY();
+            } else if (warehouse != null && col.getX() >= warehouse.x() - 5 && col.getX() < warehouse.x() + 5
+                && col.getZ() >= warehouse.z() - 5 && col.getZ() < warehouse.z() + 5) {
+                samples[count++] = warehouse.y();
+            } else {
+                samples[count++] = getTrueRoadSurfaceY(level, col.getX(), col.getZ());
+            }
+        }
+        if (count == 0) return refY;
+        if (count == 1) return samples[0];
+        if (count == 2) return (samples[0] + samples[1]) / 2;
+        java.util.Arrays.sort(samples);
+        return samples[1]; // median of the 3 lanes
+    }
+
+    private void advanceRouteStep(int completedStepY) {
+        if (completedStepY != UNSET_Y) {
+            routeY = completedStepY;
+        }
+        routeStep++;
+        stepTargetY = UNSET_Y;
+    }
+
+    private void finishCurrentRoute(CitizenEntity citizen) {
+        markRouteDone(routeIndex);
+        String label = routeLabel(routeIndex);
+        routeStep = 0;
+        routeY = UNSET_Y;
+        stepTargetY = UNSET_Y;
+        citizen.announce("Concluí o caminho nivelado (3 blocos): " + label + ".");
+    }
+
+    private boolean isRouteDone(int index) {
+        return (routeDoneMask & (1 << index)) != 0;
+    }
+
+    private void markRouteDone(int index) {
+        routeDoneMask |= (1 << index);
+    }
+
+    private void clearRouteDone(int index) {
+        routeDoneMask &= ~(1 << index);
+    }
+
+    private void refreshDynamicRoutes(CivilizationData data, CitizenEntity citizen, ServerLevel level) {
+        CivilizationData.MineSite mine = data.getMineSite(citizen.getNationId());
+        if (mine != null && mine.dimension().equals(level.dimension().location())) {
+            BlockPos origin = mine.origin();
+            if (mineRouteOrigin == null || !mineRouteOrigin.equals(origin)) {
+                mineRouteOrigin = origin.immutable();
+                clearRouteDone(ROUTE_MINE);
+                if (completed) completed = false;
+            }
+        }
+    }
+
+    private int selectNextActiveRoute(CivilizationData data, CitizenEntity citizen, ServerLevel level) {
+        CivilizationData.Warehouse warehouse = data.warehouse(citizen.getNationId());
+        if (warehouse != null && warehouse.dimension().equals(level.dimension().location()) && !isRouteDone(ROUTE_WAREHOUSE)) {
+            return ROUTE_WAREHOUSE;
+        }
+        CivilizationData.MineSite mine = data.getMineSite(citizen.getNationId());
+        if (mine != null && mine.dimension().equals(level.dimension().location()) && !isRouteDone(ROUTE_MINE)) {
+            if (mineRouteOrigin == null) mineRouteOrigin = mine.origin().immutable();
+            return ROUTE_MINE;
+        }
+        for (int dir = 0; dir < ROAD_DIRECTIONS.length; dir++) {
+            int r = ROUTE_CARDINAL_FIRST + dir;
+            if (!isRouteDone(r)) return r;
+        }
+        return -1;
+    }
+
+    private String routeLabel(int index) {
+        return switch (index) {
+            case ROUTE_WAREHOUSE -> "centro -> warehouse";
+            case ROUTE_MINE -> "centro -> entrada da mina";
+            case ROUTE_CARDINAL_FIRST -> "leste";
+            case ROUTE_CARDINAL_FIRST + 1 -> "sul";
+            case ROUTE_CARDINAL_FIRST + 2 -> "oeste";
+            case ROUTE_CARDINAL_FIRST + 3 -> "norte";
+            default -> "concluído";
+        };
+    }
+
+    private List<RoadStep> computeRouteSteps(int index, CivilizationData data, CitizenEntity citizen, ServerLevel level) {
+        if (townCenter == null) return List.of();
+        if (index == ROUTE_WAREHOUSE) {
+            CivilizationData.Warehouse warehouse = data.warehouse(citizen.getNationId());
+            if (warehouse == null || !warehouse.dimension().equals(level.dimension().location())) return List.of();
+            return computeLShapedSteps(townCenter, warehouse.center());
+        }
+        if (index == ROUTE_MINE) {
+            CivilizationData.MineSite mine = data.getMineSite(citizen.getNationId());
+            if (mine == null || !mine.dimension().equals(level.dimension().location())) return List.of();
+            // Connect the midpoint of the 15x3 Center->Warehouse avenue (x = townCenter + 12, z = townCenter)
+            // directly to the surface approach in front of the Mine/Cave entrance, forming a "T" junction!
+            BlockPos entranceApproach = mine.origin().relative(mine.direction().getOpposite(), 1);
+            BlockPos tJunctionOrigin = new BlockPos(townCenter.getX() + 12, townCenter.getY(), townCenter.getZ());
+            if (Math.abs(entranceApproach.getX() - tJunctionOrigin.getX()) <= 2) {
+                return computeLShapedSteps(tJunctionOrigin, entranceApproach);
+            }
+            return computeLShapedSteps(townCenter, entranceApproach);
+        }
+        int dirIdx = index - ROUTE_CARDINAL_FIRST;
+        if (dirIdx < 0 || dirIdx >= ROAD_DIRECTIONS.length) return List.of();
+        Direction dir = ROAD_DIRECTIONS[dirIdx];
+        List<RoadStep> steps = new ArrayList<>(CivilizationData.NATION_RADIUS_BLOCKS);
+        for (int dist = 1; dist <= CivilizationData.NATION_RADIUS_BLOCKS; dist++) {
+            BlockPos c = townCenter.relative(dir, dist);
+            steps.add(new RoadStep(c.getX(), c.getZ(), dir));
+        }
+        return steps;
+    }
+
+    /**
+     * Builds an L-shaped sequence of 3-wide RoadSteps starting at {@code from} (townCenter) and ending at {@code to}.
+     * Segment 1 marches along the dominant axis; Segment 2 turns into the remaining axis, including a 3x3 corner pad.
+     */
+    private List<RoadStep> computeLShapedSteps(BlockPos from, BlockPos to) {
+        List<RoadStep> steps = new ArrayList<>();
+        int cx = from.getX();
+        int cz = from.getZ();
+        int tx = to.getX();
+        int tz = to.getZ();
+        int dx = tx - cx;
+        int dz = tz - cz;
+
+        if (dx != 0) {
+            Direction dirX = dx > 0 ? Direction.EAST : Direction.WEST;
+            int stepX = Integer.compare(dx, 0);
+            for (int x = cx + stepX; x != tx + stepX; x += stepX) {
+                steps.add(new RoadStep(x, cz, dirX));
+            }
+        }
+        if (dz != 0) {
+            Direction dirZ = dz > 0 ? Direction.SOUTH : Direction.NORTH;
+            int stepZ = Integer.compare(dz, 0);
+            int startZ = (dx != 0) ? cz - stepZ : cz + stepZ;
+            for (int z = startZ; z != tz + stepZ; z += stepZ) {
+                steps.add(new RoadStep(tx, z, dirZ));
+            }
+        }
+        return steps;
+    }
+
+    // =========================================================================
+    // Efficient Road Maintenance (Ledger + Batched Nearest-First Repair Queue)
+    // =========================================================================
+
+    private void recordRoadCell(BlockPos floorPos) {
+        BlockPos imm = floorPos.immutable();
+        if (roadLedgerSet.add(imm)) {
+            roadLedger.add(imm);
+        }
+        repairQueue.remove(imm);
+    }
+
+    private static boolean isValidRoadFloor(BlockState state) {
+        return state.is(Blocks.DIRT_PATH) || state.is(BlockTags.PLANKS) || state.is(BlockTags.STAIRS);
+    }
+
+    private boolean isClearHeadroom(ServerLevel level, BlockPos surface) {
+        for (int dy = 0; dy < 2; dy++) {
+            BlockPos above = surface.above(dy);
+            BlockState state = level.getBlockState(above);
+            if (!state.isAir() && !state.canBeReplaced() && !isClearableVegetation(state)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean isRoadCellIntact(ServerLevel level, BlockPos floorPos, CivilizationData.Warehouse warehouse) {
+        if (isInsidePlazaOrWarehouse(floorPos, warehouse)) return true;
+        BlockState floorState = level.getBlockState(floorPos);
+        if (!isValidRoadFloor(floorState)) return false;
+        return isClearHeadroom(level, floorPos.above());
+    }
+
+    /**
+     * Scans at most {@code INSPECT_PER_TICK} cells from the road ledger per tick.
+     * Any broken floor block (turned to air/dirt/hole) or blocked headroom is queued for repair.
+     */
+    private void inspectRoadLedger(CitizenEntity citizen, ServerLevel level, CivilizationData.Warehouse warehouse) {
+        if (roadLedger.isEmpty()) return;
+        int checks = Math.min(INSPECT_PER_TICK, roadLedger.size());
+        for (int i = 0; i < checks; i++) {
+            if (inspectCursor >= roadLedger.size()) inspectCursor = 0;
+            BlockPos floorPos = roadLedger.get(inspectCursor++);
+            if (!citizen.isInsideNation(floorPos) || !level.hasChunkAt(floorPos)) continue;
+            if (!isRoadCellIntact(level, floorPos, warehouse)) {
+                repairQueue.add(floorPos);
+            }
+        }
+    }
+
+    /**
+     * Decides whether the Builder should pause construction to repair road damage right now.
+     * - Keeps focus on construction by default (never interrupts an active road for proximity alone).
+     * - Repairs immediately only if: (a) a repair batch is already in progress, (b) all roads are finished,
+     *   (c) damage is large (>= REPAIR_URGENT_QUEUE), or (d) a construction batch threshold
+     *   (REPAIR_EVERY_ACTIONS) was reached.
+     */
+    private boolean shouldRunMaintenanceNow(CitizenEntity citizen) {
+        if (repairTarget != null) return true;
+        if (repairQueue.isEmpty()) return false;
+        if (completed) return true;
+        if (repairQueue.size() >= REPAIR_URGENT_QUEUE) return true;
+        return actionsSinceRepair >= REPAIR_EVERY_ACTIONS;
+    }
+
+    private boolean tickMaintenance(CitizenEntity citizen, ServerLevel level, CivilizationData.Warehouse warehouse) {
+        if (repairTarget == null) {
+            repairTarget = pollNearestRepair(citizen, citizen.blockPosition(), Double.MAX_VALUE);
+            repairAttempts = 0;
+            if (repairTarget == null) {
+                actionsSinceRepair = 0;
+                return false;
+            }
+        }
+
+        if (!citizen.isInsideNation(repairTarget) || isInsidePlazaOrWarehouse(repairTarget, warehouse)) {
+            advanceRepairCluster(citizen, repairTarget);
+            return true;
+        }
+        if (!level.hasChunkAt(repairTarget)) {
+            repairTarget = null;
+            return false;
+        }
+        if (isRoadCellIntact(level, repairTarget, warehouse)) {
+            advanceRepairCluster(citizen, repairTarget);
+            return true;
+        }
+
+        if (++repairAttempts > REPAIR_MAX_ATTEMPTS) {
+            // Avoid getting stuck forever on a single unreachable cell.
+            advanceRepairCluster(citizen, repairTarget);
+            return true;
+        }
+
+        double distSqr = horizDistSqr(citizen, repairTarget.getX() + 0.5, repairTarget.getZ() + 0.5);
+        if (distSqr > 20.25) {
+            int walkY = getTrueRoadSurfaceY(level, repairTarget.getX(), repairTarget.getZ());
+            currentSubTask = String.format(java.util.Locale.ROOT, "Indo até reparo [%.1fm]", Math.sqrt(distSqr));
+            CitizenEntity.moveTowards(citizen, level, repairTarget.getX() + 0.5, walkY,
+                repairTarget.getZ() + 0.5, 1.0);
+            return true;
+        }
+        citizen.getNavigation().stop();
+
+        BlockPos surface = repairTarget.above();
+        CellOutcome outcome = shapeAndPaveRoadCell(citizen, level, surface, false);
+        if (outcome == CellOutcome.READY || isRoadCellIntact(level, repairTarget, warehouse)) {
+            advanceRepairCluster(citizen, repairTarget);
+        }
+        return true;
+    }
+
+    /**
+     * After fixing one broken block, continues fixing any other broken blocks within {@code REPAIR_CLUSTER_SQR}
+     * so an entire crater/section is restored in a single visit before returning to construction.
+     */
+    private void advanceRepairCluster(CitizenEntity citizen, BlockPos justFixed) {
+        repairQueue.remove(justFixed);
+        repairAttempts = 0;
+        double maxRadius = completed ? Double.MAX_VALUE : REPAIR_CLUSTER_SQR;
+        repairTarget = pollNearestRepair(citizen, justFixed, maxRadius);
+        if (repairTarget == null) {
+            actionsSinceRepair = 0;
+        }
+    }
+
+    private BlockPos pollNearestRepair(CitizenEntity citizen, BlockPos anchor, double maxDistSqr) {
+        BlockPos best = null;
+        double bestDist = maxDistSqr;
+        java.util.Iterator<BlockPos> it = repairQueue.iterator();
+        while (it.hasNext()) {
+            BlockPos candidate = it.next();
+            if (!citizen.isInsideNation(candidate)) {
+                it.remove();
+                continue;
+            }
+            double d = candidate.distSqr(anchor);
+            if (d <= bestDist) {
+                bestDist = d;
+                best = candidate;
+            }
+        }
+        if (best != null) {
+            repairQueue.remove(best);
+        }
+        return best;
+    }
+
+    private enum CellOutcome {
+        READY,
+        WORK_DONE,
+        WAITING_RESOURCE
+    }
+
+    private record RoadStep(int x, int z, Direction heading) {
+        BlockPos center(int y) {
+            return new BlockPos(x, y, z);
+        }
+
+        BlockPos lanePos(int laneOffset, int y) {
+            return switch (heading) {
+                case EAST, WEST -> new BlockPos(x, y, z + laneOffset);
+                case NORTH, SOUTH -> new BlockPos(x + laneOffset, y, z);
+                default -> new BlockPos(x, y, z);
+            };
         }
     }
 
@@ -410,7 +1168,8 @@ public final class BuilderJob implements ProfessionJob {
     }
 
     private boolean isInsidePlazaOrWarehouse(BlockPos pos, CivilizationData.Warehouse warehouse) {
-        if (townCenter != null && Math.abs(pos.getX() - townCenter.getX()) <= 3 && Math.abs(pos.getZ() - townCenter.getZ()) <= 2) {
+        if (townCenter != null && pos.getX() >= townCenter.getX() - 5 && pos.getX() < townCenter.getX() + 5
+            && pos.getZ() >= townCenter.getZ() - 5 && pos.getZ() < townCenter.getZ() + 5) {
             return true;
         }
         return warehouse != null && pos.getX() >= warehouse.x() - 5 && pos.getX() < warehouse.x() + 5
@@ -428,9 +1187,7 @@ public final class BuilderJob implements ProfessionJob {
 
         // Walk to the construction site perimeter/center once (reach covers the 10x10 area)
         if (dirtSourceTarget == null && citizen.distanceToSqr(warehouse.x() + 0.5, warehouse.y(), warehouse.z() + 0.5) > 49.0) {
-            if (citizen.getNavigation().isDone()) {
-                citizen.getNavigation().moveTo(warehouse.x() + 0.5, warehouse.y(), warehouse.z() + 0.5, 1.0);
-            }
+            CitizenEntity.moveTowards(citizen, level, warehouse.x() + 0.5, warehouse.y(), warehouse.z() + 0.5, 1.0);
             return;
         }
 
@@ -601,130 +1358,6 @@ public final class BuilderJob implements ProfessionJob {
         return Math.min(64, Math.max(1, needed));
     }
 
-    /**
-     * Builds a direct 3-block-wide road connecting the Village Center plaza directly to the Warehouse border.
-     * Handles both cardinal and L-shaped alignments seamlessly.
-     */
-    private void buildWarehouseConnectionRoad(CitizenEntity citizen, ServerLevel level, CivilizationData.Warehouse warehouse) {
-        java.util.List<BlockPos> pathCells = computeWarehouseConnectionCells(warehouse);
-        while (warehousePathStep < pathCells.size()) {
-            BlockPos cellXZ = pathCells.get(warehousePathStep);
-            if (!citizen.isInsideNation(cellXZ) || !level.hasChunkAt(cellXZ) || isInsidePlazaOrWarehouse(cellXZ, warehouse)) {
-                warehousePathStep++;
-                continue;
-            }
-            int surfaceY = getTrueRoadSurfaceY(level, cellXZ.getX(), cellXZ.getZ());
-            BlockPos surface = new BlockPos(cellXZ.getX(), surfaceY, cellXZ.getZ());
-            BlockPos ground = surface.below();
-            BlockState groundState = level.getBlockState(ground);
-
-            // Skip if already part of the plaza, warehouse wood floor, or an existing dirt path / bridge / stair
-            if (groundState.is(Blocks.DIRT_PATH) || groundState.is(BlockTags.PLANKS) || groundState.is(BlockTags.STAIRS)) {
-                warehousePathStep++;
-                continue;
-            }
-
-            double horizDistSqr = citizen.distanceToSqr(cellXZ.getX() + 0.5, citizen.getY(), cellXZ.getZ() + 0.5);
-            if (horizDistSqr > 25.0) {
-                if (citizen.getNavigation().isDone()) {
-                    citizen.getNavigation().moveTo(surface.getX() + 0.5, citizen.getY(), surface.getZ() + 0.5, 0.95);
-                }
-                return;
-            }
-
-            for (int dx = -1; dx <= 1; dx++) {
-                for (int dz = -1; dz <= 1; dz++) {
-                    for (int checkY = surfaceY - 1; checkY <= surfaceY + 4; checkY++) {
-                        BlockPos checkPos = new BlockPos(cellXZ.getX() + dx, checkY, cellXZ.getZ() + dz);
-                        if (!citizen.isInsideNation(checkPos) || !level.hasChunkAt(checkPos)) continue;
-                        BlockState checkState = level.getBlockState(checkPos);
-                        if (checkState.is(BlockTags.LOGS) || isMushroomBlock(checkState)) {
-                            clearConnectedTreeInPlot(citizen, level, checkPos);
-                            collectNearbyDrops(citizen, level);
-                            return;
-                        }
-                    }
-                }
-            }
-
-            for (int clearY = surfaceY; clearY <= surfaceY + 4; clearY++) {
-                BlockPos clearPos = new BlockPos(cellXZ.getX(), clearY, cellXZ.getZ());
-                BlockState clearState = level.getBlockState(clearPos);
-                if (!clearState.isAir() && isClearableVegetation(clearState) && level.getFluidState(clearPos).isEmpty()) {
-                    level.destroyBlock(clearPos, true, citizen);
-                }
-            }
-
-            surfaceY = getTrueRoadSurfaceY(level, cellXZ.getX(), cellXZ.getZ());
-            surface = new BlockPos(cellXZ.getX(), surfaceY, cellXZ.getZ());
-            ground = surface.below();
-            groundState = level.getBlockState(ground);
-
-            if (isWater(level, ground)) {
-                convertOwnLogsToPlanks(citizen);
-                Item plank = findInventoryItem(citizen, ItemTags.PLANKS);
-                if (plank == null) {
-                    if (!ensureResource(citizen, level, Items.OAK_PLANKS, 1, 16)) return;
-                    plank = findInventoryItem(citizen, ItemTags.PLANKS);
-                    if (plank == null) return;
-                }
-                Block plankBlock = Block.byItem(plank);
-                if (plankBlock != Blocks.AIR && placeOrReplaceBlockFromInventory(citizen, level, ground, plankBlock.defaultBlockState(), plank)) {
-                    warehousePathStep++;
-                }
-                return;
-            }
-
-            if (!equipShovel(citizen, level)) return;
-            citizen.getLookControl().setLookAt(surface.getX() + 0.5, surface.getY(), surface.getZ() + 0.5);
-            citizen.swing(net.minecraft.world.InteractionHand.MAIN_HAND);
-            if (level.setBlockAndUpdate(ground, Blocks.DIRT_PATH.defaultBlockState())) {
-                if (!level.getBlockState(surface).isAir() && isClearableVegetation(level.getBlockState(surface))) {
-                    level.destroyBlock(surface, true, citizen);
-                }
-                if (citizen.getMainHandItem().isDamageableItem()) {
-                    citizen.getMainHandItem().hurtAndBreak(1, citizen, EquipmentSlot.MAINHAND);
-                }
-            }
-            warehousePathStep++;
-            return;
-        }
-
-        warehousePathDone = true;
-        citizen.announce("Conectei o caminho principal do centro da vila até a entrada da Warehouse!");
-    }
-
-    private java.util.List<BlockPos> computeWarehouseConnectionCells(CivilizationData.Warehouse warehouse) {
-        java.util.List<BlockPos> cells = new java.util.ArrayList<>();
-        int cx = townCenter.getX();
-        int cz = townCenter.getZ();
-        int wx = warehouse.x();
-        int wz = warehouse.z();
-
-        int dx = wx - cx;
-        int dz = wz - cz;
-        int stepX = Integer.compare(dx, 0);
-        int stepZ = Integer.compare(dz, 0);
-
-        // Segment 1: along X from townCenter.x to warehouse.x (3 blocks wide on Z around cz)
-        if (stepX != 0) {
-            for (int x = cx; x != wx + stepX; x += stepX) {
-                for (int lane = -1; lane <= 1; lane++) {
-                    cells.add(new BlockPos(x, townCenter.getY(), cz + lane));
-                }
-            }
-        }
-        // Segment 2: along Z from townCenter.z to warehouse.z (3 blocks wide on X around wx)
-        if (stepZ != 0) {
-            for (int z = cz; z != wz + stepZ; z += stepZ) {
-                for (int lane = -1; lane <= 1; lane++) {
-                    cells.add(new BlockPos(wx + lane, townCenter.getY(), z));
-                }
-            }
-        }
-        return cells;
-    }
-
     private int estimateRemainingPlotDirtNeeded(ServerLevel level, CivilizationData.Warehouse warehouse) {
         int needed = 0;
         int targetGroundY = warehouse.y() - 1;
@@ -770,11 +1403,8 @@ public final class BuilderJob implements ProfessionJob {
             if (!level.hasChunkAt(floor)) return;
             if (citizen.distanceToSqr(standingPosition.getX() + 0.5, standingPosition.getY(),
                 standingPosition.getZ() + 0.5) > 36.0) {
-                if (citizen.getNavigation().isDone()) {
-                    int navY = getTrueRoadSurfaceY(level, standingPosition.getX(), standingPosition.getZ());
-                    citizen.getNavigation().moveTo(standingPosition.getX() + 0.5, navY,
-                        standingPosition.getZ() + 0.5, 1.0);
-                }
+                int navY = getTrueRoadSurfaceY(level, standingPosition.getX(), standingPosition.getZ());
+                CitizenEntity.moveTowards(citizen, level, standingPosition.getX() + 0.5, navY, standingPosition.getZ() + 0.5, 1.0);
                 return;
             }
 
@@ -870,45 +1500,115 @@ public final class BuilderJob implements ProfessionJob {
 
     private static GridBlueprint villageCenterBlueprint(ServerLevel level) {
         if (VILLAGE_CENTER_BLUEPRINT == null)
-            VILLAGE_CENTER_BLUEPRINT = GridBlueprint.load(level, "village_center_7x5");
+            VILLAGE_CENTER_BLUEPRINT = GridBlueprint.load(level, "village_center_10x10");
         return VILLAGE_CENTER_BLUEPRINT;
+    }
+
+    /**
+     * Smooths and clears the 50x50 Reforestation Zone in the NW quadrant (dx in [-56..-7], dz in [-56..-7],
+     * outside the 30-block no-replant inner radius). Never breaks saplings or tree trunks, and leaves DIRT/GRASS on top.
+     */
+    private boolean prepareReforestationZoneStep(CitizenEntity citizen, ServerLevel level, CivilizationData data) {
+        if (reforestationDone || townCenter == null) return false;
+        CivilizationData.Nation nation = data.getNation(citizen.getNationId());
+        if (nation == null) return false;
+
+        int scanned = 0;
+        while (reforestationCursor < 2500 && scanned < 25) {
+            int col = reforestationCursor % 50;
+            int row = reforestationCursor / 50;
+            int x = townCenter.getX() - 56 + col;
+            int z = townCenter.getZ() - 56 + row;
+            BlockPos probe = new BlockPos(x, townCenter.getY(), z);
+
+            if (!citizen.isInsideNation(probe) || !LumberjackJob.isInsideReforestationZone(nation, probe)) {
+                reforestationCursor++;
+                continue;
+            }
+            if (!level.hasChunkAt(probe)) return false;
+
+            int topY = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z) - 1;
+            BlockPos ground = new BlockPos(x, topY, z);
+            BlockState groundState = level.getBlockState(ground);
+
+            // Never disturb planted saplings or growing trees in the reforestation zone!
+            if (groundState.is(BlockTags.LOGS) || groundState.is(BlockTags.SAPLINGS)
+                || level.getBlockState(ground.above()).is(BlockTags.SAPLINGS)) {
+                reforestationCursor++;
+                scanned++;
+                continue;
+            }
+
+            // Clear surface scrub/flowers/bushes (excluding saplings)
+            BlockPos above = ground.above();
+            BlockState aboveState = level.getBlockState(above);
+            if (!aboveState.isAir() && !aboveState.is(BlockTags.SAPLINGS) && isClearableVegetation(aboveState)) {
+                level.destroyBlock(above, true, citizen);
+            }
+
+            // Fill water puddles or steep 2-block pits/steps relative to neighbors
+            boolean isWater = !level.getFluidState(ground).isEmpty();
+            int neighborAvgY = (level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x + 1, z) - 1
+                + level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x - 1, z) - 1
+                + level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z + 1) - 1
+                + level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z - 1) - 1) / 4;
+
+            if (isWater || topY < neighborAvgY - 1) {
+                double distSqr = horizDistSqr(citizen, x + 0.5, z + 0.5);
+                if (distSqr > 36.0) {
+                    currentSubTask = "Indo nivelar área de reflorestamento 50x50 (NO)";
+                    CitizenEntity.moveTowards(citizen, level, x + 0.5, topY + 1, z + 0.5, 1.0);
+                    return true;
+                }
+                BlockPos fillPos = isWater ? ground : ground.above();
+                currentSubTask = "Aterrando área de reflorestamento em [" + fillPos.toShortString() + "]";
+                citizen.getLookControl().setLookAt(fillPos.getX() + 0.5, fillPos.getY() + 0.5, fillPos.getZ() + 0.5);
+                citizen.swing(net.minecraft.world.InteractionHand.MAIN_HAND);
+                if (countItem(citizen, Items.DIRT) > 0) {
+                    placeBlockFromInventory(citizen, level, fillPos, Blocks.DIRT.defaultBlockState(), Items.DIRT);
+                } else {
+                    level.setBlockAndUpdate(fillPos, Blocks.DIRT.defaultBlockState());
+                }
+                return true;
+            }
+
+            if (topY > neighborAvgY + 1 && (groundState.is(BlockTags.DIRT) || groundState.is(Blocks.GRASS_BLOCK))) {
+                double distSqr = horizDistSqr(citizen, x + 0.5, z + 0.5);
+                if (distSqr > 36.0) {
+                    currentSubTask = "Indo suavizar relevo do reflorestamento 50x50 (NO)";
+                    CitizenEntity.moveTowards(citizen, level, x + 0.5, topY + 1, z + 0.5, 1.0);
+                    return true;
+                }
+                currentSubTask = "Suavizando degrau no reflorestamento em [" + ground.toShortString() + "]";
+                equipShovelForRoad(citizen, level);
+                citizen.getLookControl().setLookAt(ground.getX() + 0.5, ground.getY() + 0.5, ground.getZ() + 0.5);
+                citizen.swing(net.minecraft.world.InteractionHand.MAIN_HAND);
+                if (level.destroyBlock(ground, false, citizen)) {
+                    citizen.getNpcInventory().addItem(new ItemStack(Items.DIRT, 1));
+                }
+                return true;
+            }
+
+            // Ensure top block is plantable dirt/grass if stone is exposed
+            if (isExposedStone(groundState)) {
+                level.setBlockAndUpdate(ground, Blocks.DIRT.defaultBlockState());
+            }
+
+            reforestationCursor++;
+            scanned++;
+        }
+
+        if (reforestationCursor >= 2500) {
+            reforestationDone = true;
+            citizen.announce("Concluí a terraplanagem suave da área de reflorestamento 50x50 (NO) para o Lenhador.");
+        }
+        return false;
     }
 
     private static boolean isNaturalPlazaGround(BlockState state) {
         return state.is(BlockTags.DIRT) || state.is(Blocks.GRASS_BLOCK) || state.is(Blocks.PODZOL)
             || state.is(Blocks.MYCELIUM) || state.is(Blocks.MOSS_BLOCK)
             || state.is(BlockTags.BASE_STONE_OVERWORLD);
-    }
-
-    private void buildBridgeCell(CitizenEntity citizen, ServerLevel level, BlockPos deck, Direction direction) {
-        convertOwnLogsToPlanks(citizen);
-        Item plank = findInventoryItem(citizen, ItemTags.PLANKS);
-        if (plank == null) {
-            if (!ensureResource(citizen, level, Items.OAK_PLANKS, 1, 16)) return;
-            plank = findInventoryItem(citizen, ItemTags.PLANKS);
-            if (plank == null) return;
-        }
-        pendingResourceId = "";
-        Block block = Block.byItem(plank);
-        if (block == Blocks.AIR) return;
-        if (!level.getBlockState(deck).isAir() && !level.getBlockState(deck).canBeReplaced()) return;
-        if (!level.setBlockAndUpdate(deck, block.defaultBlockState())) return;
-        consumeItem(citizen, plank);
-        supportBridge(citizen, level, deck, plank);
-        previousSurfaceY[laneIndex] = deck.getY();
-        advanceLane();
-    }
-
-    private void supportBridge(CitizenEntity citizen, ServerLevel level, BlockPos deck, Item plank) {
-        if (laneIndex != 1) return;
-        BlockPos support = deck.below();
-        int depth = 0;
-        while (depth < 6 && level.hasChunkAt(support) && level.getFluidState(support).is(FluidTags.WATER)) {
-            if (!consumeItem(citizen, plank)) return;
-            level.setBlockAndUpdate(support, Block.byItem(plank).defaultBlockState());
-            support = support.below();
-            depth++;
-        }
     }
 
     private boolean placeStairIfNeeded(CitizenEntity citizen, ServerLevel level, BlockPos target, Direction direction) {
@@ -942,14 +1642,9 @@ public final class BuilderJob implements ProfessionJob {
             shovelRequestSent = false;
             return true;
         }
-        if (StorageJob.retrieveBestShovel(citizen, level)) return false;
-        if (!shovelRequestSent) {
-            CivilizationData.get(level).requestStorageItem(citizen.getNationId(), citizen.getUUID(),
-                StorageJob.BEST_SHOVEL_REQUEST_ID, 1);
-            citizen.announce("Estou sem pá; solicitei uma ao Storager para abrir os caminhos.");
-            shovelRequestSent = true;
-        }
-        return false;
+        citizen.setItemSlot(EquipmentSlot.MAINHAND, new ItemStack(Items.WOODEN_SHOVEL));
+        shovelRequestSent = false;
+        return true;
     }
 
     private boolean equipPickaxe(CitizenEntity citizen, ServerLevel level) {
@@ -964,14 +1659,46 @@ public final class BuilderJob implements ProfessionJob {
             pickaxeRequestSent = false;
             return true;
         }
-        if (StorageJob.retrieveBestPickaxe(citizen, level)) return false;
-        if (!pickaxeRequestSent) {
-            CivilizationData.get(level).requestStorageItem(citizen.getNationId(), citizen.getUUID(),
-                StorageJob.BEST_PICKAXE_REQUEST_ID, 1);
-            citizen.announce("Encontrei pedra exposta; pedi uma picareta ao Storager antes de removê-la.");
-            pickaxeRequestSent = true;
+        citizen.setItemSlot(EquipmentSlot.MAINHAND, new ItemStack(Items.WOODEN_PICKAXE));
+        pickaxeRequestSent = false;
+        return true;
+    }
+
+    private boolean handlePendingWarehouseResource(CitizenEntity citizen, ServerLevel level, CivilizationData data) {
+        if (pendingResourceId.isEmpty()) return false;
+        net.minecraft.resources.ResourceLocation key = net.minecraft.resources.ResourceLocation.tryParse(pendingResourceId);
+        if (key == null) {
+            pendingResourceId = "";
+            return false;
         }
-        return false;
+        Item item = BuiltInRegistries.ITEM.getValue(key);
+        if (item == Items.AIR || item == Items.DIRT) {
+            pendingResourceId = "";
+            return false;
+        }
+        boolean isPlanks = new ItemStack(item).is(ItemTags.PLANKS);
+        boolean isStairs = new ItemStack(item).is(ItemTags.STAIRS);
+        if (isPlanks) convertOwnLogsToPlanks(citizen);
+        int have = isPlanks ? countTaggedItem(citizen, ItemTags.PLANKS)
+            : (isStairs ? countTaggedItem(citizen, ItemTags.STAIRS) : countItem(citizen, item));
+        String reqId = StorageJob.resourceRequestId(item);
+        if (have >= 1) {
+            pendingResourceId = "";
+            cancelDirtRequest(citizen, data, reqId);
+            return false;
+        }
+        if (!hasOpenResourceRequest(data, citizen, reqId)) {
+            requestResource(citizen, level, item, isPlanks ? 16 : 4);
+        }
+        StorageJob.retrieveRequestedItem(citizen, level, item, isPlanks ? 16 : 4);
+        int haveNow = isPlanks ? countTaggedItem(citizen, ItemTags.PLANKS)
+            : (isStairs ? countTaggedItem(citizen, ItemTags.STAIRS) : countItem(citizen, item));
+        if (haveNow >= 1) {
+            pendingResourceId = "";
+            cancelDirtRequest(citizen, data, reqId);
+            return false;
+        }
+        return true;
     }
 
     private boolean ensureResource(CitizenEntity citizen, ServerLevel level, Item item, int amount) {
@@ -1041,8 +1768,7 @@ public final class BuilderJob implements ProfessionJob {
             source.standPosition().getZ() + 0.5);
         if (distSqr > 12.25) {
             if (dirtSourceTarget == null || !dirtSourceTarget.equals(source.position()) || citizen.getNavigation().isDone()) {
-                citizen.getNavigation().moveTo(source.standPosition().getX() + 0.5, source.standPosition().getY(),
-                    source.standPosition().getZ() + 0.5, 1.0);
+                CitizenEntity.moveTowardsPos(citizen, level, source.standPosition(), 1.0);
                 dirtSourceTarget = source.position().immutable();
             }
             return false;
@@ -1124,13 +1850,21 @@ public final class BuilderJob implements ProfessionJob {
         if (townCenter != null) {
             int dx = Math.abs(position.getX() - townCenter.getX());
             int dz = Math.abs(position.getZ() - townCenter.getZ());
-            if (dx <= 3 && dz <= 2) return true;
+            if (dx <= 5 && dz <= 5) return true;
             if ((dx <= 1 && dz <= CivilizationData.NATION_RADIUS_BLOCKS)
                 || (dz <= 1 && dx <= CivilizationData.NATION_RADIUS_BLOCKS)) return true;
+            if (Math.abs((position.getX() - townCenter.getX()) - 12) <= 1 && position.getZ() >= townCenter.getZ()) return true;
         }
-        CivilizationData.Warehouse warehouse = CivilizationData.get(level).warehouse(citizen.getNationId());
-        return warehouse != null && Math.abs(position.getX() - warehouse.x()) <= 5
-            && Math.abs(position.getZ() - warehouse.z()) <= 5;
+        if (roadLedgerSet.contains(position)) return true;
+        CivilizationData data = CivilizationData.get(level);
+        CivilizationData.Warehouse warehouse = data.warehouse(citizen.getNationId());
+        if (warehouse != null && Math.abs(position.getX() - warehouse.x()) <= 5
+            && Math.abs(position.getZ() - warehouse.z()) <= 5) {
+            return true;
+        }
+        CivilizationData.MineSite mine = data.getMineSite(citizen.getNationId());
+        return mine != null && Math.abs(position.getX() - mine.x()) <= 4
+            && Math.abs(position.getZ() - mine.z()) <= 4;
     }
 
     private void cancelDirtRequest(CitizenEntity citizen, CivilizationData data, String dirtRequestId) {
@@ -1192,39 +1926,6 @@ public final class BuilderJob implements ProfessionJob {
         CivilizationData.get(level).requestStorageItem(citizen.getNationId(), citizen.getUUID(),
             StorageJob.resourceRequestId(item), amount);
         citizen.announce("Pedi " + amount + " " + BuiltInRegistries.ITEM.getKey(item) + " ao Storager para continuar a obra.");
-    }
-
-    private BlockPos roadPosition(Direction direction, int forward, int side) {
-        return switch (direction) {
-            case EAST -> townCenter.offset(forward, 0, side);
-            case SOUTH -> townCenter.offset(side, 0, forward);
-            case WEST -> townCenter.offset(-forward, 0, side);
-            case NORTH -> townCenter.offset(side, 0, -forward);
-            default -> townCenter;
-        };
-    }
-
-    private void advanceLane() {
-        laneIndex++;
-        if (laneIndex >= ROAD_WIDTH) {
-            laneIndex = 0;
-            distance++;
-            if (distance > CivilizationData.NATION_RADIUS_BLOCKS) {
-                directionIndex++;
-                distance = 1;
-                previousSurfaceY = new int[ROAD_WIDTH];
-            }
-        }
-    }
-
-    private String directionName() {
-        if (directionIndex >= ROAD_DIRECTIONS.length) return "concluído";
-        return switch (ROAD_DIRECTIONS[directionIndex]) {
-            case EAST -> "leste";
-            case SOUTH -> "sul";
-            case WEST -> "oeste";
-            default -> "norte";
-        };
     }
 
     private boolean isWater(ServerLevel level, BlockPos ground) {

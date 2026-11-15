@@ -158,7 +158,10 @@ public final class MinerJob implements ProfessionJob {
 
     public String workStatus(CitizenEntity citizen, ServerLevel level) {
         if (oreDeliveryPending) return "Mochila cheia: entregando recursos ao armazém";
-        if (toolPickupPending || !isPickaxe(citizen.getMainHandItem())) return "Buscando uma picareta adequada";
+        if (toolPickupPending || !isPickaxe(citizen.getMainHandItem())) {
+            String waitDesc = StorageJob.describeOpenWaitRequest(citizen, level);
+            return !waitDesc.isEmpty() ? waitDesc : "Buscando uma picareta adequada";
+        }
         if (mineOrigin == null) return "Escolhendo um local seguro para a mina";
         BlockPos approach = mineOrigin.relative(direction, step).below(step);
         if (citizen.distanceToSqr(approach.getX() + 0.5, approach.getY() + 0.5, approach.getZ() + 0.5) > 16.0)
@@ -173,6 +176,10 @@ public final class MinerJob implements ProfessionJob {
             return citizen.distanceToSqr(base.getX() + 0.5, base.getY(), base.getZ() + 0.5) > 16.0;
         }
         if (toolPickupPending || (!isPickaxe(citizen.getMainHandItem()) && bestInventoryPickaxe(citizen) == null)) {
+            CivilizationData.Warehouse warehouse = CivilizationData.get(level).warehouse(citizen.getNationId());
+            if (warehouse != null && warehouse.dimension().equals(level.dimension().location())) {
+                return !StorageJob.isCitizenInsideWarehouse(citizen, warehouse);
+            }
             return !citizen.getNavigation().isDone();
         }
         if (mineOrigin == null) return true;
@@ -258,9 +265,9 @@ public final class MinerJob implements ProfessionJob {
         BlockPos base = basePosition(citizen, level);
         double baseX = base.getX() + 0.5;
         double baseY = base.getY();
-        double baseZ = base.getZ() + 0.5;
-        if (citizen.distanceToSqr(baseX, baseY, baseZ) > 16.0) {
-            if (citizen.getNavigation().isDone()) citizen.getNavigation().moveTo(baseX, baseY, baseZ, 0.9);
+        double baseZ = base.getZ();
+        if (citizen.distanceToSqr(baseX, baseY, baseZ + 0.5) > 16.0) {
+            CitizenEntity.moveTowardsPos(citizen, level, base, 0.9);
         }
         return false;
     }
@@ -283,7 +290,7 @@ public final class MinerJob implements ProfessionJob {
             double baseY = base.getY();
             double baseZ = base.getZ() + 0.5;
             if (citizen.distanceToSqr(baseX, baseY, baseZ) > 16.0) {
-                if (citizen.getNavigation().isDone()) citizen.getNavigation().moveTo(baseX, baseY, baseZ, 0.9);
+                CitizenEntity.moveTowardsPos(citizen, level, base, 0.9);
                 return;
             }
             if (StorageJob.depositAllResources(citizen, level)) {
@@ -305,8 +312,7 @@ public final class MinerJob implements ProfessionJob {
 
         if (step == 0 && insideNation(citizen, level, mineOrigin)
             && citizen.distanceToSqr(mineOrigin.getX() + 0.5, mineOrigin.getY(), mineOrigin.getZ() + 0.5) > 16.0) {
-            if (citizen.getNavigation().isDone())
-                citizen.getNavigation().moveTo(mineOrigin.getX() + 0.5, mineOrigin.getY(), mineOrigin.getZ() + 0.5, 0.9);
+            CitizenEntity.moveTowardsPos(citizen, level, mineOrigin, 0.9);
             return;
         }
 
@@ -328,7 +334,10 @@ public final class MinerJob implements ProfessionJob {
             return;
         }
         if (citizen.distanceToSqr(approach.getX() + 0.5, approach.getY() + 0.5, approach.getZ() + 0.5) > 16.0) {
-            citizen.getNavigation().moveTo(approach.getX() + 0.5, approach.getY() + 0.5, approach.getZ() + 0.5, 0.9);
+            if (citizen.getNavigation().isDone() || citizen.getNavigation().getTargetPos() == null
+                || citizen.getNavigation().getTargetPos().distSqr(approach) > 4.0) {
+                citizen.getNavigation().moveTo(approach.getX() + 0.5, approach.getY() + 0.5, approach.getZ() + 0.5, 0.9);
+            }
             return;
         }
         // Prepare the next lower step only after reaching the current stair cell. Doing
@@ -484,36 +493,47 @@ public final class MinerJob implements ProfessionJob {
         BlockPos base = basePosition(citizen, level);
         int baseY = base.getY();
 
+        // Village Map Layout:
+        // The 15x3 Center->Warehouse avenue occupies x in [nation.x() + 5 .. nation.x() + 19] along z = nation.z().
+        // Its midpoint is at x = nation.x() + 12. The Mine/Cave sits directly South (+Z) of that midpoint,
+        // just outside the 30-block no-replant inner radius (z = nation.z() + 33), forming a "T" road junction!
         int[][] offsets = {
-            {24, 0}, {-24, 0}, {0, 24}, {0, -24},
+            {12, 33}, {12, 35}, {12, 31},
+            {12, -33}, {-12, 33}, {0, 33},
             {24, 24}, {24, -24}, {-24, 24}, {-24, -24},
-            {32, 0}, {-32, 0}, {0, 32}, {0, -32},
-            {20, 0}, {-20, 0}, {0, 20}, {0, -20},
-            {28, 0}, {-28, 0}, {0, 28}, {0, -28}
+            {32, 0}, {-32, 0}, {0, 32}, {0, -32}
         };
         CivilizationData.Warehouse warehouse = data.warehouse(nation.id());
         BlockPos bestCandidate = null;
-        int bestDiff = Integer.MAX_VALUE;
+        int bestScore = Integer.MAX_VALUE;
         Direction bestDirection = Direction.SOUTH;
 
-        for (int[] offset : offsets) {
+        for (int idx = 0; idx < offsets.length; idx++) {
+            int[] offset = offsets[idx];
             int x = nation.x() + offset[0];
             int z = nation.z() + offset[1];
             BlockPos probe = new BlockPos(x, baseY, z);
             if (!level.hasChunkAt(probe)) continue;
             int surfaceY = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
-            BlockPos candidate = new BlockPos(x, baseY, z);
+            BlockPos candidate = new BlockPos(x, surfaceY, z);
             if (!nation.contains(candidate) || (Math.abs(offset[0]) < 10 && Math.abs(offset[1]) < 10)) continue;
-            if (warehouse != null && warehouse.center().distSqr(candidate) < (warehouse.radius() + 12.0) * (warehouse.radius() + 12.0)) continue;
+            if (warehouse != null && warehouse.center().distSqr(candidate) < (warehouse.radius() + 10.0) * (warehouse.radius() + 10.0)) continue;
 
-            int diff = Math.abs(surfaceY - baseY);
-            if (diff < bestDiff) {
-                bestDiff = diff;
+            // Strongly prefer the primary "T"-junction site at (+12, +33) heading SOUTH
+            int diff = Math.abs(surfaceY - baseY) + idx * 12;
+            if (diff < bestScore) {
+                bestScore = diff;
                 bestCandidate = candidate;
-                bestDirection = Math.abs(offset[0]) >= Math.abs(offset[1])
-                    ? (offset[0] >= 0 ? Direction.EAST : Direction.WEST)
-                    : (offset[1] >= 0 ? Direction.SOUTH : Direction.NORTH);
-                if (diff == 0) break;
+                if (offset[0] == 12 && offset[1] > 0) {
+                    bestDirection = Direction.SOUTH;
+                } else if (offset[0] == 12 && offset[1] < 0) {
+                    bestDirection = Direction.NORTH;
+                } else {
+                    bestDirection = Math.abs(offset[0]) >= Math.abs(offset[1])
+                        ? (offset[0] >= 0 ? Direction.EAST : Direction.WEST)
+                        : (offset[1] >= 0 ? Direction.SOUTH : Direction.NORTH);
+                }
+                if (idx == 0) break;
             }
         }
 

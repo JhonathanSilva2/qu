@@ -47,6 +47,8 @@ import java.util.UUID;
 public class CitizenEntity extends PathfinderMob {
     private static final EntityDataAccessor<String> DATA_PROFESSION =
         SynchedEntityData.defineId(CitizenEntity.class, EntityDataSerializers.STRING);
+    private static final EntityDataAccessor<String> DATA_WORK_STATUS =
+        SynchedEntityData.defineId(CitizenEntity.class, EntityDataSerializers.STRING);
 
     private final SimpleContainer npcInventory = new SimpleContainer(27);
 
@@ -80,6 +82,7 @@ public class CitizenEntity extends PathfinderMob {
         this.getNavigation().setCanFloat(true);
         this.setPathfindingMalus(PathType.WATER, 0.0f);
         this.setPathfindingMalus(PathType.WATER_BORDER, 0.0f);
+        this.setPathfindingMalus(PathType.LEAVES, 8.0f);
         this.goalSelector.addGoal(0, new FloatGoal(this));
         this.goalSelector.addGoal(2, new FollowPlayerGoal());
     }
@@ -88,10 +91,15 @@ public class CitizenEntity extends PathfinderMob {
     protected void defineSynchedData(SynchedEntityData.Builder builder) {
         super.defineSynchedData(builder);
         builder.define(DATA_PROFESSION, "");
+        builder.define(DATA_WORK_STATUS, "");
     }
 
     public String getProfessionId() {
         return this.entityData.get(DATA_PROFESSION);
+    }
+
+    public String getSyncedWorkStatus() {
+        return this.entityData.get(DATA_WORK_STATUS);
     }
 
     public void follow(Player player) {
@@ -295,20 +303,69 @@ public class CitizenEntity extends PathfinderMob {
         return "Sem tarefa no momento";
     }
 
+    public String shortWorkStatus(ServerLevel level) {
+        if (activeJob == builderJob) {
+            String waitDesc = StorageJob.describeOpenWaitRequest(this, level);
+            if (!waitDesc.isEmpty()) return waitDesc;
+            return builderJob.workStatus();
+        }
+        String full = currentWorkStatus(level);
+        int nl = full.indexOf('\n');
+        String firstLine = nl >= 0 ? full.substring(0, nl) : full;
+        if (firstLine.startsWith("Fase: ")) firstLine = firstLine.substring(6);
+        return firstLine.length() > 72 ? firstLine.substring(0, 69) + "..." : firstLine;
+    }
+
     @Override
     public InteractionResult mobInteract(Player player, InteractionHand hand) {
         if (player instanceof ServerPlayer serverPlayer && hand == InteractionHand.MAIN_HAND && !this.level().isClientSide()) {
-            String status = this.level() instanceof ServerLevel serverLevel
-                ? currentWorkStatus(serverLevel) : "Status indisponível";
-            serverPlayer.sendSystemMessage(Component.literal(getDisplayNameText()).withStyle(ChatFormatting.GOLD)
-                .append(Component.literal(" » Status: ").withStyle(ChatFormatting.GRAY))
-                .append(Component.literal(status).withStyle(ChatFormatting.WHITE)));
+            if (this.level() instanceof ServerLevel serverLevel) {
+                sendDetailedRightClickStatus(serverPlayer, serverLevel);
+            } else {
+                serverPlayer.sendSystemMessage(Component.literal(getDisplayNameText()).withStyle(ChatFormatting.GOLD)
+                    .append(Component.literal(" » Status indisponível").withStyle(ChatFormatting.GRAY)));
+            }
             serverPlayer.openMenu(new SimpleMenuProvider(
                 (syncId, inventory, ignored) -> ChestMenu.threeRows(syncId, inventory, npcInventory),
                 Component.literal(getDisplayNameText())
             ));
         }
         return InteractionResult.SUCCESS;
+    }
+
+    private void sendDetailedRightClickStatus(ServerPlayer player, ServerLevel level) {
+        String status = currentWorkStatus(level);
+        player.sendSystemMessage(Component.literal("━━━ " + getDisplayNameText() + " ━━━").withStyle(ChatFormatting.GOLD, ChatFormatting.BOLD));
+        for (String line : status.split("\n")) {
+            player.sendSystemMessage(Component.literal(" • ").withStyle(ChatFormatting.DARK_GRAY)
+                .append(Component.literal(line).withStyle(ChatFormatting.WHITE)));
+        }
+        ItemStack mainHand = getMainHandItem();
+        String handText = mainHand.isEmpty() ? "mão vazia"
+            : mainHand.getHoverName().getString() + (mainHand.isDamageableItem()
+                ? " (" + (mainHand.getMaxDamage() - mainHand.getDamageValue()) + "/" + mainHand.getMaxDamage() + ")"
+                : " x" + mainHand.getCount());
+        int usedSlots = 0;
+        for (int i = 0; i < npcInventory.getContainerSize(); i++) {
+            if (!npcInventory.getItem(i).isEmpty()) usedSlots++;
+        }
+        BlockPos navTarget = getNavigation().getTargetPos();
+        String navText = getNavigation().isDone() ? "parado/no local"
+            : (navTarget == null ? "em movimento" : "indo para [" + navTarget.toShortString() + "]");
+        player.sendSystemMessage(Component.literal(" • ").withStyle(ChatFormatting.DARK_GRAY)
+            .append(Component.literal("Posição: [").withStyle(ChatFormatting.GRAY))
+            .append(Component.literal(blockPosition().toShortString()).withStyle(ChatFormatting.AQUA))
+            .append(Component.literal("] | Navegação: ").withStyle(ChatFormatting.GRAY))
+            .append(Component.literal(navText).withStyle(ChatFormatting.YELLOW)));
+        player.sendSystemMessage(Component.literal(" • ").withStyle(ChatFormatting.DARK_GRAY)
+            .append(Component.literal("Mão: ").withStyle(ChatFormatting.GRAY))
+            .append(Component.literal(handText).withStyle(ChatFormatting.GREEN))
+            .append(Component.literal(" | Mochila: " + usedSlots + "/" + npcInventory.getContainerSize() + " slots").withStyle(ChatFormatting.GRAY)));
+        if (activeJob != null) {
+            player.sendSystemMessage(Component.literal(" • ").withStyle(ChatFormatting.DARK_GRAY)
+                .append(Component.literal("Detalhe técnico: ").withStyle(ChatFormatting.DARK_AQUA))
+                .append(Component.literal(activeJob.debugStatus(this, level)).withStyle(ChatFormatting.GRAY)));
+        }
     }
 
     public void teleportToPlayer(ServerPlayer player) {
@@ -350,14 +407,14 @@ public class CitizenEntity extends PathfinderMob {
             }
             if (!enforceNationBoundary(serverLevel)) return;
         }
-        if (travelTarget != null && !this.level().isClientSide()) {
+        if (travelTarget != null && !this.level().isClientSide() && this.level() instanceof ServerLevel travelLevel) {
             if (this.blockPosition().closerThan(travelTarget, 2.0)) {
                 announce("Cheguei a " + travelLocationName + ".");
                 travelTarget = null;
                 travelLocationName = "";
                 this.getNavigation().stop();
             } else if (this.tickCount % 20 == 0 && this.getNavigation().isDone()) {
-                this.getNavigation().moveTo(travelTarget.getX() + 0.5, travelTarget.getY(), travelTarget.getZ() + 0.5, 1.0);
+                moveTowardsPos(this, travelLevel, travelTarget, 1.0);
             }
         }
         if (this.level().isClientSide() || !(this.level() instanceof ServerLevel level)) return;
@@ -365,15 +422,29 @@ public class CitizenEntity extends PathfinderMob {
 
         if (workStuckNoticeCooldown > 0) workStuckNoticeCooldown--;
 
-        // Autonomous Navigation Watchdog: progressive local recovery before last-resort teleport
-        if (hasActiveProfession() && workNavigationExpected(level) && !getNavigation().isDone() && !this.swinging) {
+        // Road & Plaza Speed Bonus (+22% movement speed on DIRT_PATH, PLANKS, or STAIRS)
+        if (this.tickCount % 5 == 0) {
+            updateRoadSpeedBonus(level);
+        }
+
+        // Sync concise activity status to client every 10 ticks for overhead display below name tag
+        if (this.tickCount % 10 == 0) {
+            String concise = shortWorkStatus(level);
+            if (!concise.equals(this.entityData.get(DATA_WORK_STATUS))) {
+                this.entityData.set(DATA_WORK_STATUS, concise);
+            }
+        }
+
+        // Autonomous Navigation Watchdog (MineColonies-style Pass-Through before emergency teleport)
+        if (hasActiveProfession() && workNavigationExpected(level) && !this.swinging) {
             if (distanceToSqr(workLastX, workLastY, workLastZ) < 0.04) workStuckTicks++;
             else workStuckTicks = 0;
             workLastX = getX();
             workLastY = getY();
             workLastZ = getZ();
-            if (workStuckTicks == 60 || workStuckTicks == 140) {
+            if (workStuckTicks == 40 || workStuckTicks == 90 || workStuckTicks == 150) {
                 clearBlockingLeavesAround(level);
+                tryPassThroughStep(level);
                 this.getJumpControl().jump();
                 this.getNavigation().recomputePath();
             } else if (workStuckTicks >= 600) {
@@ -588,12 +659,97 @@ public class CitizenEntity extends PathfinderMob {
                 for (int dy = 0; dy <= 2; dy++) {
                     BlockPos pos = base.offset(dx, dy, dz);
                     if (!belongsToNation(pos)) continue;
-                    if (level.getBlockState(pos).is(net.minecraft.tags.BlockTags.LEAVES)) {
+                    var state = level.getBlockState(pos);
+                    if (state.is(net.minecraft.tags.BlockTags.LEAVES)
+                        || (!state.is(net.minecraft.tags.BlockTags.SAPLINGS) && BuilderJob.isClearableVegetation(state))) {
                         level.destroyBlock(pos, true, this);
                     }
                 }
             }
         }
+    }
+
+    /**
+     * MineColonies-style Pass-Through step: if the citizen is stuck on a bush/leaf/weird step toward
+     * their current navigation target, smoothly steps 1 block toward the target onto safe ground.
+     */
+    private void tryPassThroughStep(ServerLevel level) {
+        BlockPos navTarget = this.getNavigation().getTargetPos();
+        if (navTarget == null) return;
+        double dx = navTarget.getX() + 0.5 - this.getX();
+        double dz = navTarget.getZ() + 0.5 - this.getZ();
+        double dist = Math.sqrt(dx * dx + dz * dz);
+        if (dist < 1.0) return;
+        int stepX = (int) Math.round(dx / dist);
+        int stepZ = (int) Math.round(dz / dist);
+        for (int dy = 1; dy >= -1; dy--) {
+            BlockPos candidate = this.blockPosition().offset(stepX, dy, stepZ);
+            if (!belongsToNation(candidate) || !level.hasChunkAt(candidate)) continue;
+            if (level.getBlockState(candidate).getCollisionShape(level, candidate).isEmpty()
+                && level.getBlockState(candidate.above()).getCollisionShape(level, candidate.above()).isEmpty()
+                && level.getBlockState(candidate.below()).isFaceSturdy(level, candidate.below(), net.minecraft.core.Direction.UP)
+                && level.getFluidState(candidate).isEmpty()) {
+                this.teleportTo(candidate.getX() + 0.5, candidate.getY(), candidate.getZ() + 0.5);
+                return;
+            }
+        }
+    }
+
+    private void updateRoadSpeedBonus(ServerLevel level) {
+        var speedAttr = this.getAttribute(Attributes.MOVEMENT_SPEED);
+        if (speedAttr == null) return;
+        BlockPos below = this.blockPosition().below();
+        var state = level.getBlockState(below);
+        if (state.isAir()) {
+            state = level.getBlockState(this.blockPosition());
+        }
+        boolean onRoadOrPlaza = state.is(net.minecraft.world.level.block.Blocks.DIRT_PATH)
+            || state.is(net.minecraft.tags.BlockTags.PLANKS)
+            || state.is(net.minecraft.tags.BlockTags.STAIRS);
+        double desiredBase = onRoadOrPlaza ? 0.305 : 0.25;
+        if (Math.abs(speedAttr.getBaseValue() - desiredBase) > 0.001) {
+            speedAttr.setBaseValue(desiredBase);
+        }
+    }
+
+    public static boolean moveTowards(CitizenEntity citizen, ServerLevel level, double destX, double destY, double destZ, double speed) {
+        double dx = destX - citizen.getX();
+        double dz = destZ - citizen.getZ();
+        double horizDist = Math.sqrt(dx * dx + dz * dz);
+        double targetX = destX;
+        double targetY = destY;
+        double targetZ = destZ;
+        if (horizDist > 24.0) {
+            double step = 20.0 / horizDist;
+            targetX = citizen.getX() + dx * step;
+            targetZ = citizen.getZ() + dz * step;
+            int wx = net.minecraft.util.Mth.floor(targetX);
+            int wz = net.minecraft.util.Mth.floor(targetZ);
+            if (level.hasChunkAt(new BlockPos(wx, (int) destY, wz))) {
+                int surfaceY = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, wx, wz);
+                while (surfaceY > level.getMinY() + 5) {
+                    BlockPos below = new BlockPos(wx, surfaceY - 1, wz);
+                    var state = level.getBlockState(below);
+                    if (state.is(net.minecraft.tags.BlockTags.LOGS) || BuilderJob.isClearableVegetation(state)) {
+                        surfaceY--;
+                    } else {
+                        break;
+                    }
+                }
+                targetY = surfaceY;
+            }
+        }
+        BlockPos curTarget = citizen.getNavigation().getTargetPos();
+        if (!citizen.getNavigation().isDone() && curTarget != null) {
+            double tdx = curTarget.getX() + 0.5 - targetX;
+            double tdz = curTarget.getZ() + 0.5 - targetZ;
+            if (tdx * tdx + tdz * tdz <= 9.0) return true;
+        }
+        return citizen.getNavigation().moveTo(targetX, targetY, targetZ, speed);
+    }
+
+    public static boolean moveTowardsPos(CitizenEntity citizen, ServerLevel level, BlockPos pos, double speed) {
+        return moveTowards(citizen, level, pos.getX() + 0.5, pos.getY(), pos.getZ() + 0.5, speed);
     }
 
     public static AttributeSupplier.Builder createAttributes() {
