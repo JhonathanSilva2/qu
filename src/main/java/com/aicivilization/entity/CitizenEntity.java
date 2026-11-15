@@ -3,6 +3,7 @@ package com.aicivilization.entity;
 import com.aicivilization.AICivilizationMod;
 import com.aicivilization.data.CivilizationData;
 import com.aicivilization.profession.LumberjackJob;
+import com.aicivilization.profession.BuilderJob;
 import com.aicivilization.profession.MinerJob;
 import com.aicivilization.profession.ProfessionJob;
 import com.aicivilization.storage.StorageJob;
@@ -46,6 +47,7 @@ public class CitizenEntity extends PathfinderMob {
     private final LumberjackJob lumberjackJob = new LumberjackJob();
     private final StorageJob storageJob = new StorageJob();
     private final MinerJob minerJob = new MinerJob();
+    private final BuilderJob builderJob = new BuilderJob();
     private ProfessionJob activeJob;
 
     private Player followTarget;
@@ -133,6 +135,8 @@ public class CitizenEntity extends PathfinderMob {
         return minerJob;
     }
 
+    public boolean isBuilderEnabled() { return activeJob == builderJob; }
+
     public boolean startLumberjack() {
         if (this.level().isClientSide() || !(this.level() instanceof ServerLevel level)) return false;
         return setJob(lumberjackJob, level);
@@ -164,6 +168,13 @@ public class CitizenEntity extends PathfinderMob {
         if (this.level() instanceof ServerLevel level && activeJob == minerJob) {
             stopJob(level, true);
         }
+    }
+
+    public boolean startBuilder() {
+        if (this.level().isClientSide() || !(this.level() instanceof ServerLevel level) || nationId == null) return false;
+        if (!setJob(builderJob, level)) return false;
+        announce("Vou preparar o terreno da warehouse quando o Storager solicitar e abrir os caminhos da vila.");
+        return true;
     }
 
     public void stopProfession() {
@@ -312,6 +323,11 @@ public class CitizenEntity extends PathfinderMob {
     public void tick() {
         super.tick();
         if (!this.level().isClientSide() && this.level() instanceof ServerLevel serverLevel && nationId != null) {
+            if (CivilizationData.get(serverLevel).getNation(nationId) == null) {
+                stopProfession();
+                discard();
+                return;
+            }
             if (!enforceNationBoundary(serverLevel)) return;
         }
         if (travelTarget != null && !this.level().isClientSide()) {
@@ -368,6 +384,7 @@ public class CitizenEntity extends PathfinderMob {
         lumberjackJob.save(tag);
         storageJob.save(tag);
         minerJob.save(tag);
+        builderJob.save(tag);
         if (nationId != null) tag.store("NationId", UUIDUtil.CODEC, nationId);
         tag.putString("NationName", nationName);
         if (lastPositionInsideNation != null) tag.store("LastPositionInsideNation", BlockPos.CODEC, lastPositionInsideNation);
@@ -384,12 +401,15 @@ public class CitizenEntity extends PathfinderMob {
         lumberjackJob.load(tag);
         storageJob.load(tag);
         minerJob.load(tag);
+        builderJob.load(tag);
 
         String activeJobId = tag.getStringOr("ActiveJobId", "");
         if (activeJobId.isEmpty() || "none".equals(activeJobId)) {
             if (tag.getBooleanOr("StorageEnabled", false)) activeJobId = StorageJob.ID;
             else if (tag.getBooleanOr("MinerEnabled", false)) activeJobId = MinerJob.ID;
             else if (tag.getBooleanOr("LumberjackEnabled", false)) activeJobId = LumberjackJob.ID;
+            else if (tag.getBooleanOr("BuilderEnabled", false) || "Builder".equals(tag.getStringOr("ProfessionLabel", "")))
+                activeJobId = BuilderJob.ID;
         }
 
         if (LumberjackJob.ID.equals(activeJobId)) {
@@ -401,6 +421,9 @@ public class CitizenEntity extends PathfinderMob {
         } else if (MinerJob.ID.equals(activeJobId)) {
             activeJob = minerJob;
             professionLabel = MinerJob.LABEL;
+        } else if (BuilderJob.ID.equals(activeJobId)) {
+            activeJob = builderJob;
+            professionLabel = BuilderJob.LABEL;
         } else {
             activeJob = null;
             professionLabel = tag.getStringOr("ProfessionLabel", "Citizen");
@@ -481,6 +504,8 @@ public class CitizenEntity extends PathfinderMob {
         CivilizationData.Nation territory = CivilizationData.get(serverLevel).findNationAt(position, serverLevel.dimension().location());
         return territory != null && territory.id().equals(nationId);
     }
+
+    public boolean isInsideNation(BlockPos position) { return belongsToNation(position); }
 
     private boolean enforceNationBoundary(ServerLevel level) {
         if (belongsToNation(this.blockPosition())) {

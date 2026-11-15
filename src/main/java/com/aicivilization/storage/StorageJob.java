@@ -39,6 +39,8 @@ public final class StorageJob implements ProfessionJob {
     public static final String LABEL = "Storager";
     public static final String BEST_AXE_REQUEST_ID = "ai_civilization:best_axe";
     public static final String BEST_PICKAXE_REQUEST_ID = "ai_civilization:best_pickaxe";
+    public static final String BEST_SHOVEL_REQUEST_ID = "ai_civilization:best_shovel";
+    private static final String RESOURCE_REQUEST_PREFIX = "ai_civilization:resource:";
     private static final int DEFAULT_WAREHOUSE_RADIUS = 12;
     private static final int TICK_INTERVAL = 20;
     private static final List<ToolRecipe> AXE_RECIPES = List.of(
@@ -53,6 +55,12 @@ public final class StorageJob implements ProfessionJob {
         new ToolRecipe(Items.IRON_PICKAXE, Items.IRON_INGOT, false),
         new ToolRecipe(Items.STONE_PICKAXE, Items.COBBLESTONE, false),
         new ToolRecipe(Items.WOODEN_PICKAXE, null, true)
+    );
+    private static final List<ToolRecipe> SHOVEL_RECIPES = List.of(
+        new ToolRecipe(Items.DIAMOND_SHOVEL, Items.DIAMOND, false, 1),
+        new ToolRecipe(Items.IRON_SHOVEL, Items.IRON_INGOT, false, 1),
+        new ToolRecipe(Items.STONE_SHOVEL, Items.COBBLESTONE, false, 1),
+        new ToolRecipe(Items.WOODEN_SHOVEL, null, true, 1)
     );
 
     private int cooldown;
@@ -177,13 +185,27 @@ public final class StorageJob implements ProfessionJob {
                 resourceDonorId = null;
             }
         }
+        List<BlockPos> chests = findChests(level, warehouse);
+        if (!chests.isEmpty()) data.markWarehousePlotPrepared(nationId);
+        if (!data.warehousePlotPrepared(nationId)) {
+            boolean firstRequest = !data.warehousePlotRequested(nationId);
+            data.requestWarehousePlot(nationId);
+            if (firstRequest) citizen.announce("Solicitei ao Builder um terreno plano de 10x10 para começar a warehouse.");
+            if (!atDonor && citizen.distanceToSqr(warehouse.x() + 0.5, warehouse.y(), warehouse.z() + 0.5) > 196.0) {
+                if (citizen.getNavigation().isDone())
+                    citizen.getNavigation().moveTo(warehouse.x() + 0.5, warehouse.y(), warehouse.z() + 0.5, 0.9);
+                return;
+            }
+            processRequests(citizen, level, data, warehouse, chests, null);
+            if (chests.isEmpty()) takeLogsFromNearbyCitizen(citizen, level, warehouse, 2);
+            return;
+        }
         if (!atDonor && citizen.distanceToSqr(warehouse.x() + 0.5, warehouse.y(), warehouse.z() + 0.5) > 196.0) {
             if (citizen.getNavigation().isDone())
                 citizen.getNavigation().moveTo(warehouse.x() + 0.5, warehouse.y(), warehouse.z() + 0.5, 0.9);
             return;
         }
 
-        List<BlockPos> chests = findChests(level, warehouse);
         BlockPos inbox = warehouse.inbox();
         if (inbox == null || !(level.getBlockEntity(inbox) instanceof ChestBlockEntity)) {
             if (!chests.isEmpty()) {
@@ -216,6 +238,7 @@ public final class StorageJob implements ProfessionJob {
         CivilizationData data = CivilizationData.get(level);
         CivilizationData.Warehouse warehouse = data.warehouse(citizen.getNationId());
         if (warehouse == null) return "warehouse=missing, requests=" + data.openStorageRequests(citizen.getNationId()).size();
+        if (!data.warehousePlotPrepared(citizen.getNationId())) return "phase=waiting-for-builder-plot-10x10, warehouse=" + warehouse.center().toShortString();
         if (resourceDonorId != null) return "phase=walking-to-lumberjack, donor=" + resourceDonorId;
         List<BlockPos> chests = findChests(level, warehouse);
         String phase;
@@ -234,6 +257,7 @@ public final class StorageJob implements ProfessionJob {
         CivilizationData data = CivilizationData.get(level);
         CivilizationData.Warehouse warehouse = data.warehouse(citizen.getNationId());
         if (warehouse == null) return "Escolhendo o local do armazém";
+        if (!data.warehousePlotPrepared(citizen.getNationId())) return "Guardando recursos e aguardando o Builder preparar o terreno 10x10";
         if (resourceDonorId != null) return "Indo buscar madeira com um cidadão da nação";
         if (citizen.distanceToSqr(warehouse.x() + 0.5, warehouse.y(), warehouse.z() + 0.5) > 196.0)
             return "Indo até o armazém";
@@ -420,6 +444,35 @@ public final class StorageJob implements ProfessionJob {
         return minimumTier <= 0 ? BEST_PICKAXE_REQUEST_ID : BEST_PICKAXE_REQUEST_ID + ".tier_" + minimumTier;
     }
 
+    public static String resourceRequestId(Item item) {
+        return RESOURCE_REQUEST_PREFIX + BuiltInRegistries.ITEM.getKey(item);
+    }
+
+    public static boolean retrieveBestShovel(CitizenEntity citizen, ServerLevel level) {
+        return retrieveBestTool(citizen, level, SHOVEL_RECIPES, "pá");
+    }
+
+    /** Walks to the nation's Storager and transfers an already fulfilled material request. */
+    public static boolean retrieveRequestedItem(CitizenEntity citizen, ServerLevel level, Item item, int amount) {
+        UUID storagerId = CivilizationData.get(level).storager(citizen.getNationId());
+        if (storagerId == null) return false;
+        Entity entity = level.getEntity(storagerId);
+        if (!(entity instanceof CitizenEntity storager) || storager == citizen
+            || !citizen.getNationId().equals(storager.getNationId())) return false;
+        if (citizen.distanceToSqr(storager) > 16.0) {
+            if (citizen.getNavigation().isDone()) citizen.getNavigation().moveTo(storager, 0.9);
+            return true;
+        }
+        int available = Math.min(amount, countItem(storager.getNpcInventory(), item));
+        if (available <= 0 || !citizen.getNpcInventory().canAddItem(new ItemStack(item, available))) return false;
+        if (removeItem(storager.getNpcInventory(), item, available) != 0) return false;
+        citizen.getNpcInventory().addItem(new ItemStack(item, available));
+        storager.getNpcInventory().setChanged();
+        citizen.getNpcInventory().setChanged();
+        citizen.announce("Recebi " + available + " " + BuiltInRegistries.ITEM.getKey(item) + " do Storager.");
+        return true;
+    }
+
     private static int pickaxeTier(Item pickaxe) {
         if (pickaxe == Items.NETHERITE_PICKAXE) return 4;
         if (pickaxe == Items.DIAMOND_PICKAXE) return 3;
@@ -433,6 +486,24 @@ public final class StorageJob implements ProfessionJob {
                                             List<ToolRecipe> recipes, String toolName) {
         CivilizationData.Warehouse warehouse = CivilizationData.get(level).warehouse(citizen.getNationId());
         if (warehouse == null || !warehouse.dimension().equals(level.dimension().location())) return false;
+        UUID storagerId = CivilizationData.get(level).storager(citizen.getNationId());
+        Entity storagerEntity = storagerId == null ? null : level.getEntity(storagerId);
+        if (storagerEntity instanceof CitizenEntity storager && storager != citizen) {
+            for (ToolRecipe recipe : recipes) {
+                int slot = findItem(storager.getNpcInventory(), recipe.tool());
+                if (slot < 0) continue;
+                if (citizen.distanceToSqr(storager) > 16.0) {
+                    if (citizen.getNavigation().isDone()) citizen.getNavigation().moveTo(storager, 0.9);
+                    return true;
+                }
+                ItemStack toolStack = storager.getNpcInventory().getItem(slot).split(1);
+                if (storager.getNpcInventory().getItem(slot).isEmpty()) storager.getNpcInventory().setItem(slot, ItemStack.EMPTY);
+                storager.getNpcInventory().setChanged();
+                citizen.setItemSlot(net.minecraft.world.entity.EquipmentSlot.MAINHAND, toolStack);
+                citizen.announce("Peguei a melhor " + toolName + " no Storager e vou voltar ao trabalho.");
+                return true;
+            }
+        }
         List<BlockPos> chests = findChests(level, warehouse);
         for (ToolRecipe recipe : recipes) {
             for (BlockPos pos : chests) {
@@ -456,10 +527,16 @@ public final class StorageJob implements ProfessionJob {
 
     private void processRequests(CitizenEntity citizen, ServerLevel level, CivilizationData data,
                                  CivilizationData.Warehouse warehouse, List<BlockPos> chestPositions, BlockPos inboxPos) {
-        if (chestPositions.isEmpty()) return;
-        ChestBlockEntity inbox = level.getBlockEntity(inboxPos) instanceof ChestBlockEntity chest ? chest : null;
-        if (inbox == null) return;
-        for (CivilizationData.StorageRequest request : data.openStorageRequests(citizen.getNationId())) {
+        ChestBlockEntity inbox = inboxPos != null && level.getBlockEntity(inboxPos) instanceof ChestBlockEntity chest ? chest : null;
+        if (!chestPositions.isEmpty() && inbox == null) return;
+        List<CivilizationData.StorageRequest> requests = new ArrayList<>(data.openStorageRequests(citizen.getNationId()));
+        requests.sort(Comparator.comparingInt(request -> isToolRequest(request.itemId()) ? 0 : 1));
+        for (CivilizationData.StorageRequest request : requests) {
+            if (request.itemId().startsWith(RESOURCE_REQUEST_PREFIX)) {
+                processResourceRequest(citizen, data, request, request.itemId().substring(RESOURCE_REQUEST_PREFIX.length()),
+                    request.count(), chestPositions, level);
+                continue;
+            }
             List<ToolRecipe> recipes;
             String toolName;
             if (request.itemId().equals(BEST_AXE_REQUEST_ID)) {
@@ -471,6 +548,9 @@ public final class StorageJob implements ProfessionJob {
                     : parseRequestedPickaxeTier(request.itemId());
                 recipes = PICKAXE_RECIPES.stream().filter(candidate -> pickaxeTier(candidate.tool()) >= minimumTier).toList();
                 toolName = "picareta";
+            } else if (request.itemId().equals(BEST_SHOVEL_REQUEST_ID)) {
+                recipes = SHOVEL_RECIPES;
+                toolName = "pá";
             } else continue;
             ToolRecipe stocked = recipes.stream()
                 .filter(candidate -> countItem(citizen.getNpcInventory(), chestPositions, level, candidate.tool()) > 0)
@@ -494,15 +574,23 @@ public final class StorageJob implements ProfessionJob {
                 }
                 continue;
             }
-            if (countItem(citizen.getNpcInventory(), chestPositions, level, Items.STICK) < 2) {
-                int requiredPlanks = recipe.usesPlanks() ? 5 : 2;
-                if (countTaggedItems(citizen.getNpcInventory(), chestPositions, level, ItemTags.PLANKS) < requiredPlanks
-                    && !convertLogsToPlanks(citizen, chestPositions, level)) continue;
-                if (!convertPlanksToSticks(citizen, chestPositions, level)) continue;
-                recipe = findCraftableTool(citizen.getNpcInventory(), chestPositions, level, recipes);
-                if (recipe == null) continue;
-            }
+            if (!ensurePlanksForTool(citizen, level, warehouse, chestPositions, recipe)) continue;
+            if (countItem(citizen.getNpcInventory(), chestPositions, level, Items.STICK) < 2
+                && !convertPlanksToSticks(citizen, chestPositions, level)) continue;
+            recipe = findCraftableTool(citizen.getNpcInventory(), chestPositions, level, recipes);
+            if (recipe == null) continue;
             ItemStack toolStack = new ItemStack(recipe.tool());
+            if (chestPositions.isEmpty()) {
+                boolean consumedMaterial = recipe.usesPlanks()
+                    ? consumeTaggedItems(citizen.getNpcInventory(), chestPositions, level, ItemTags.PLANKS, recipe.materialCount())
+                    : consumeItem(citizen.getNpcInventory(), chestPositions, level, recipe.material(), recipe.materialCount());
+                if (!consumedMaterial || !consumeItem(citizen.getNpcInventory(), chestPositions, level, Items.STICK, 2)) continue;
+                ItemStack remainder = citizen.getNpcInventory().addItem(toolStack);
+                if (!remainder.isEmpty()) continue;
+                data.fulfillStorageRequest(request.id());
+                citizen.announce("Fabriquei " + toolName + " e vou guardar comigo até a warehouse ficar pronta.");
+                continue;
+            }
             ChestBlockEntity destination = null;
             for (BlockPos pos : chestPositions) {
                 if (pos.equals(inboxPos)) continue;
@@ -519,8 +607,8 @@ public final class StorageJob implements ProfessionJob {
                 return;
             }
             boolean consumedMaterial = recipe.usesPlanks()
-                ? consumeTaggedItems(citizen.getNpcInventory(), chestPositions, level, ItemTags.PLANKS, 3)
-                : consumeItem(citizen.getNpcInventory(), chestPositions, level, recipe.material(), 3);
+                ? consumeTaggedItems(citizen.getNpcInventory(), chestPositions, level, ItemTags.PLANKS, recipe.materialCount())
+                : consumeItem(citizen.getNpcInventory(), chestPositions, level, recipe.material(), recipe.materialCount());
             if (!consumedMaterial || !consumeItem(citizen.getNpcInventory(), chestPositions, level, Items.STICK, 2)) continue;
             ItemStack remainder = insert(destination, toolStack);
             if (!remainder.isEmpty()) continue;
@@ -529,15 +617,108 @@ public final class StorageJob implements ProfessionJob {
         }
     }
 
+    private boolean isToolRequest(String itemId) {
+        return itemId.equals(BEST_AXE_REQUEST_ID) || itemId.equals(BEST_PICKAXE_REQUEST_ID)
+            || itemId.startsWith(BEST_PICKAXE_REQUEST_ID + ".tier_") || itemId.equals(BEST_SHOVEL_REQUEST_ID);
+    }
+
     private ToolRecipe findCraftableTool(Container inventory, List<BlockPos> chestPositions, ServerLevel level,
                                          List<ToolRecipe> recipes) {
         for (ToolRecipe recipe : recipes) {
             int materialCount = recipe.usesPlanks()
                 ? countTaggedItems(inventory, chestPositions, level, ItemTags.PLANKS)
                 : countItem(inventory, chestPositions, level, recipe.material());
-            if (materialCount >= 3) return recipe;
+            if (materialCount >= recipe.materialCount()) return recipe;
         }
         return null;
+    }
+
+    private boolean ensurePlanksForTool(CitizenEntity citizen, ServerLevel level,
+                                        CivilizationData.Warehouse warehouse, List<BlockPos> chests,
+                                        ToolRecipe recipe) {
+        for (int attempt = 0; attempt < 8; attempt++) {
+            int requiredPlanks = (recipe.usesPlanks() ? recipe.materialCount() : 0)
+                + (countItem(citizen.getNpcInventory(), chests, level, Items.STICK) < 2 ? 2 : 0);
+            if (countTaggedItems(citizen.getNpcInventory(), chests, level, ItemTags.PLANKS) >= requiredPlanks) return true;
+            if (convertLogsToPlanks(citizen, chests, level)) continue;
+            if (takeLogsFromNearbyCitizen(citizen, level, warehouse, 2)) continue;
+            return false;
+        }
+        int requiredPlanks = (recipe.usesPlanks() ? recipe.materialCount() : 0)
+            + (countItem(citizen.getNpcInventory(), chests, level, Items.STICK) < 2 ? 2 : 0);
+        return countTaggedItems(citizen.getNpcInventory(), chests, level, ItemTags.PLANKS) >= requiredPlanks;
+    }
+
+    private void processResourceRequest(CitizenEntity storager, CivilizationData data,
+                                        CivilizationData.StorageRequest request, String itemId, int count,
+                                        List<BlockPos> chests, ServerLevel level) {
+        ResourceLocation key = ResourceLocation.tryParse(itemId);
+        if (key == null) return;
+        Item item = BuiltInRegistries.ITEM.getValue(key);
+        if (item == Items.AIR || count <= 0) return;
+        if (countItem(storager.getNpcInventory(), chests, level, item) < count) {
+            if (new ItemStack(item).is(ItemTags.PLANKS)) {
+                for (int attempt = 0; attempt < 8 && countItem(storager.getNpcInventory(), chests, level, item) < count; attempt++) {
+                    if (!convertLogsToRequestedPlanks(storager, chests, level, item)) break;
+                }
+            } else if (new ItemStack(item).is(ItemTags.STAIRS)) {
+                craftRequestedStairs(storager, chests, level, item, count);
+            }
+        }
+        if (countItem(storager.getNpcInventory(), chests, level, item) < count
+            || !storager.getNpcInventory().canAddItem(new ItemStack(item, count))) return;
+        if (!consumeItem(storager.getNpcInventory(), chests, level, item, count)) return;
+        storager.getNpcInventory().addItem(new ItemStack(item, count));
+        storager.getNpcInventory().setChanged();
+        data.fulfillStorageRequest(request.id());
+        storager.announce("Separei " + count + " " + BuiltInRegistries.ITEM.getKey(item) + " para o Builder.");
+    }
+
+    private boolean convertLogsToRequestedPlanks(CitizenEntity citizen, List<BlockPos> chests, ServerLevel level, Item planks) {
+        for (int slot = 0; slot < citizen.getNpcInventory().getContainerSize(); slot++) {
+            ItemStack stack = citizen.getNpcInventory().getItem(slot);
+            if (!stack.is(ItemTags.LOGS) || planksForLog(stack.getItem()) != planks) continue;
+            if (!citizen.getNpcInventory().canAddItem(new ItemStack(planks, 4))) return false;
+            stack.shrink(1);
+            if (stack.isEmpty()) citizen.getNpcInventory().setItem(slot, ItemStack.EMPTY);
+            citizen.getNpcInventory().addItem(new ItemStack(planks, 4));
+            citizen.getNpcInventory().setChanged();
+            return true;
+        }
+        for (BlockPos pos : chests) {
+            if (!(level.getBlockEntity(pos) instanceof ChestBlockEntity chest)) continue;
+            for (int slot = 0; slot < chest.getContainerSize(); slot++) {
+                ItemStack stack = chest.getItem(slot);
+                if (!stack.is(ItemTags.LOGS) || planksForLog(stack.getItem()) != planks) continue;
+                if (!citizen.getNpcInventory().canAddItem(new ItemStack(planks, 4))) return false;
+                stack.shrink(1);
+                if (stack.isEmpty()) chest.setItem(slot, ItemStack.EMPTY);
+                chest.setChanged();
+                citizen.getNpcInventory().addItem(new ItemStack(planks, 4));
+                citizen.getNpcInventory().setChanged();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void craftRequestedStairs(CitizenEntity citizen, List<BlockPos> chests, ServerLevel level, Item stairs, int targetCount) {
+        ResourceLocation stairId = BuiltInRegistries.ITEM.getKey(stairs);
+        String path = stairId.getPath();
+        if (!path.endsWith("_stairs")) return;
+        Item planks = BuiltInRegistries.ITEM.getValue(ResourceLocation.fromNamespaceAndPath(
+            stairId.getNamespace(), path.substring(0, path.length() - "_stairs".length()) + "_planks"));
+        if (planks == Items.AIR) return;
+        int crafts = 0;
+        while (countItem(citizen.getNpcInventory(), chests, level, stairs) < targetCount && crafts++ < 8) {
+            if (countItem(citizen.getNpcInventory(), chests, level, planks) < 6
+                && !convertLogsToRequestedPlanks(citizen, chests, level, planks)) return;
+            if (countItem(citizen.getNpcInventory(), chests, level, planks) < 6
+                || !citizen.getNpcInventory().canAddItem(new ItemStack(stairs, 4))) return;
+            if (!consumeItem(citizen.getNpcInventory(), chests, level, planks, 6)) return;
+            citizen.getNpcInventory().addItem(new ItemStack(stairs, 4));
+            citizen.getNpcInventory().setChanged();
+        }
     }
 
     private int parseRequestedPickaxeTier(String requestId) {
@@ -570,9 +751,9 @@ public final class StorageJob implements ProfessionJob {
         Item planksItem = planksForLog(log);
         if (planksItem == Items.AIR) return false;
         int available = countItem(citizen.getNpcInventory(), chestPositions, level, log);
-        if (available < 2) return false;
-        if (!consumeItem(citizen.getNpcInventory(), chestPositions, level, log, 2)) return false;
-        ItemStack planks = new ItemStack(planksItem, 8);
+        if (available < 1) return false;
+        if (!consumeItem(citizen.getNpcInventory(), chestPositions, level, log, 1)) return false;
+        ItemStack planks = new ItemStack(planksItem, 4);
         ItemStack remainder = insert(citizen.getNpcInventory(), planks);
         if (!remainder.isEmpty()) {
             for (BlockPos pos : chestPositions) {
@@ -582,7 +763,7 @@ public final class StorageJob implements ProfessionJob {
             }
         }
         if (!remainder.isEmpty()) {
-            insert(citizen.getNpcInventory(), new ItemStack(log, 2));
+            insert(citizen.getNpcInventory(), new ItemStack(log, 1));
             return false;
         }
         return true;
@@ -1117,14 +1298,14 @@ public final class StorageJob implements ProfessionJob {
     private static Item findConvertibleLog(Container inventory, List<BlockPos> chestPositions, ServerLevel level) {
         for (int i = 0; i < inventory.getContainerSize(); i++) {
             ItemStack stack = inventory.getItem(i);
-            if (stack.is(ItemTags.LOGS) && countItem(inventory, chestPositions, level, stack.getItem()) >= 2
+            if (stack.is(ItemTags.LOGS) && countItem(inventory, chestPositions, level, stack.getItem()) >= 1
                 && planksForLog(stack.getItem()) != Items.AIR) return stack.getItem();
         }
         for (BlockPos pos : chestPositions) {
             if (!(level.getBlockEntity(pos) instanceof ChestBlockEntity chest)) continue;
             for (int i = 0; i < chest.getContainerSize(); i++) {
                 ItemStack stack = chest.getItem(i);
-                if (stack.is(ItemTags.LOGS) && countItem(inventory, chestPositions, level, stack.getItem()) >= 2
+                if (stack.is(ItemTags.LOGS) && countItem(inventory, chestPositions, level, stack.getItem()) >= 1
                     && planksForLog(stack.getItem()) != Items.AIR) return stack.getItem();
             }
         }
@@ -1162,5 +1343,9 @@ public final class StorageJob implements ProfessionJob {
         return remaining;
     }
 
-    private record ToolRecipe(Item tool, Item material, boolean usesPlanks) {}
+    private record ToolRecipe(Item tool, Item material, boolean usesPlanks, int materialCount) {
+        private ToolRecipe(Item tool, Item material, boolean usesPlanks) {
+            this(tool, material, usesPlanks, 3);
+        }
+    }
 }

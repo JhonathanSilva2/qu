@@ -11,6 +11,7 @@ import net.minecraft.tags.BlockTags;
 import net.minecraft.tags.ItemTags;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.EquipmentSlot;
+import net.minecraft.world.entity.ai.navigation.PathNavigation;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
@@ -19,14 +20,18 @@ import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.levelgen.Heightmap;
+import net.minecraft.world.level.pathfinder.Path;
 import net.minecraft.world.level.storage.ValueInput;
 import net.minecraft.world.level.storage.ValueOutput;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 
@@ -38,9 +43,16 @@ public final class LumberjackJob implements ProfessionJob {
     public static final String ID = "lumberjack";
     public static final String LABEL = "LumberJack";
     private static final int MAX_TREE_LOGS = 128;
+    private static final int TREE_SEARCH_COOLDOWN_TICKS = 30;
+    private static final int ABANDONED_TREE_TICKS = 1200;
+    private static final int MAX_APPROACH_PATH_CHECKS = 6;
 
     private int lumberjackCooldown;
     private BlockPos lumberjackTarget;
+    private BlockPos plannedApproach;
+    private BlockPos plannedApproachFor;
+    private BlockPos failedApproachFor;
+    private int approachRetryCooldown;
     private final List<BlockPos> temporaryTower = new ArrayList<>();
     private boolean announcedSearching;
     private int stuckTicks;
@@ -57,14 +69,15 @@ public final class LumberjackJob implements ProfessionJob {
     private int patrolIndex;
     private int patrolLastRefreshTick;
     private int sweepLogCount;
-    private int skippedTreeCooldown;
+    private int treeSearchCooldown;
+    private final Map<BlockPos, Long> abandonedTreeBases = new HashMap<>();
     private int saplingLookupCooldown;
     private int reforestationCooldown;
-    private BlockPos skippedTreeBase;
     private boolean lumberjackDeliveryPending;
     private final List<BlockPos> pendingReplantPositions = new ArrayList<>();
     private int toolLookupCooldown;
     private boolean toolPickupPending;
+    private WorkPhase phase = WorkPhase.SEARCHING;
 
     @Override
     public String getId() {
@@ -79,6 +92,15 @@ public final class LumberjackJob implements ProfessionJob {
     @Override
     public boolean start(CitizenEntity citizen, ServerLevel level) {
         this.lumberjackTarget = null;
+        this.plannedApproach = null;
+        this.plannedApproachFor = null;
+        this.failedApproachFor = null;
+        this.approachRetryCooldown = 0;
+        this.chopProgress = 0.0f;
+        this.stuckTicks = 0;
+        this.lastX = citizen.getX();
+        this.lastY = citizen.getY();
+        this.lastZ = citizen.getZ();
         this.lumberjackCooldown = 0;
         this.announcedSearching = false;
         this.lastAnnouncedWoodMilestone = countLogs(citizen) / 16;
@@ -90,21 +112,27 @@ public final class LumberjackJob implements ProfessionJob {
         this.patrolPoints = List.of();
         this.patrolNationId = citizen.getNationId();
         this.pendingReplantPositions.clear();
-        this.skippedTreeBase = null;
-        this.skippedTreeCooldown = 0;
+        this.abandonedTreeBases.clear();
+        this.treeSearchCooldown = 0;
         this.saplingLookupCooldown = 0;
         this.reforestationCooldown = 0;
         this.lumberjackDeliveryPending = false;
         this.toolLookupCooldown = 0;
         this.toolPickupPending = false;
+        this.phase = WorkPhase.SEARCHING;
         citizen.announce("Vou trabalhar como lenhador e procurar árvores.");
         return true;
     }
 
     @Override
     public void stop(CitizenEntity citizen, ServerLevel level, boolean announce) {
+        clearDestroyProgress(citizen, level);
         this.lumberjackTarget = null;
+        this.plannedApproach = null;
+        this.plannedApproachFor = null;
+        this.failedApproachFor = null;
         this.chopProgress = 0.0f;
+        this.phase = WorkPhase.IDLE;
         citizen.getNavigation().stop();
         removeTemporaryTower(citizen, level);
         if (announce) {
@@ -116,6 +144,7 @@ public final class LumberjackJob implements ProfessionJob {
     public void save(ValueOutput output) {
         if (lumberjackTarget != null) output.store("LumberjackTarget", BlockPos.CODEC, lumberjackTarget);
         output.putFloat("ChopProgress", chopProgress);
+        output.putString("LumberjackPhase", phase.name());
         output.store("PendingReplant", BlockPos.CODEC.listOf(), List.copyOf(pendingReplantPositions));
     }
 
@@ -123,6 +152,7 @@ public final class LumberjackJob implements ProfessionJob {
     public void load(ValueInput input) {
         lumberjackTarget = input.read("LumberjackTarget", BlockPos.CODEC).orElse(null);
         chopProgress = input.getFloatOr("ChopProgress", 0.0f);
+        phase = WorkPhase.fromId(input.getStringOr("LumberjackPhase", WorkPhase.SEARCHING.name()));
         pendingReplantPositions.clear();
         input.read("PendingReplant", BlockPos.CODEC.listOf()).ifPresent(pendingReplantPositions::addAll);
     }
@@ -130,10 +160,16 @@ public final class LumberjackJob implements ProfessionJob {
     @Override
     public String workStatus(CitizenEntity citizen, ServerLevel level) {
         if (StorageJob.hasLumberjackDeliveryResources(citizen)) return "Entregando recursos ao armazém";
+        if (phase == WorkPhase.WAITING_FOR_TOOL) return "Solicitando ou buscando um machado no Storager";
+        if (phase == WorkPhase.WAITING_FOR_SAPLING) return "Solicitando mudas ao Storager";
+        if (phase == WorkPhase.COLLECTING) return "Recolhendo os recursos derrubados pela árvore";
+        if (phase == WorkPhase.RECOVERING) return "Desobstruindo o caminho para uma árvore";
+        if (phase == WorkPhase.REFORESTING) return "Replantando árvores no território";
+        if (phase == WorkPhase.PATROLLING) return "Percorrendo o território à procura de madeira";
         if (lumberjackTarget == null) return citizen.getNavigation().isDone() ? "Procurando madeira" : "Patrulhando o território";
         if (!isChoppableTreeBlock(level.getBlockState(lumberjackTarget))) return "Procurando outra árvore";
         return citizen.distanceToSqr(lumberjackTarget.getX() + 0.5, lumberjackTarget.getY() + 0.5,
-            lumberjackTarget.getZ() + 0.5) > 20.25 ? "Indo até uma árvore" : "Cortando madeira";
+            lumberjackTarget.getZ() + 0.5) > 9.0 ? "Indo até uma árvore" : "Cortando madeira";
     }
 
     @Override
@@ -141,16 +177,19 @@ public final class LumberjackJob implements ProfessionJob {
         String target = lumberjackTarget == null ? "none" : lumberjackTarget.toShortString()
             + "/" + BuiltInRegistries.BLOCK.getKey(level.getBlockState(lumberjackTarget).getBlock());
         BlockPos leaf = findBlockingLeaf(citizen, level);
-        return "target=" + target + ", chop=" + String.format(java.util.Locale.ROOT, "%.2f", chopProgress)
-            + ", stuckTicks=" + stuckTicks + ", blockedTree=" + (skippedTreeBase == null ? "none" : skippedTreeBase.toShortString())
+        return "phase=" + phase.name().toLowerCase(java.util.Locale.ROOT) + ", target=" + target
+            + ", approach=" + (plannedApproach == null ? "none" : plannedApproach.toShortString())
+            + ", chop=" + String.format(java.util.Locale.ROOT, "%.2f", chopProgress)
+            + ", stuckTicks=" + stuckTicks + ", abandonedTrees=" + abandonedTreeBases.size()
             + ", blockingLeaf=" + (leaf == null ? "none" : leaf.toShortString())
             + ", pendingReplant=" + pendingReplantPositions.size();
     }
 
     @Override
     public boolean needsNavigation(CitizenEntity citizen, ServerLevel level) {
-        return lumberjackTarget != null
-            && citizen.distanceToSqr(lumberjackTarget.getX() + 0.5, citizen.getY(), lumberjackTarget.getZ() + 0.5) > 9.0;
+        BlockPos destination = plannedApproach != null ? plannedApproach : lumberjackTarget;
+        return destination != null && citizen.distanceToSqr(destination.getX() + 0.5, destination.getY(),
+            destination.getZ() + 0.5) > 9.0;
     }
 
     @Override
@@ -161,13 +200,19 @@ public final class LumberjackJob implements ProfessionJob {
     }
 
     private void doLumberjackWork(CitizenEntity citizen, ServerLevel level) {
-        if (skippedTreeCooldown > 0 && --skippedTreeCooldown == 0) skippedTreeBase = null;
+        treeSearchCooldown = Math.max(0, treeSearchCooldown - 10);
+        approachRetryCooldown = Math.max(0, approachRetryCooldown - 10);
+        expireAbandonedTrees(level.getGameTime());
         if (saplingLookupCooldown > 0) saplingLookupCooldown -= 10;
         if (reforestationCooldown > 0) reforestationCooldown -= 10;
-        if (collectNearbyTreeDrops(citizen, level)) return;
+        if (collectNearbyTreeDrops(citizen, level)) {
+            phase = WorkPhase.COLLECTING;
+            return;
+        }
         replantAvailableSaplings(citizen, level);
 
         if (StorageJob.hasLumberjackDeliveryResources(citizen)) {
+            phase = WorkPhase.DELIVERING;
             if (!lumberjackDeliveryPending) {
                 citizen.announce(StorageJob.lumberjackDeliveryMessage(citizen));
                 lumberjackDeliveryPending = true;
@@ -177,17 +222,27 @@ public final class LumberjackJob implements ProfessionJob {
         lumberjackDeliveryPending = false;
 
         if (isAxe(citizen.getMainHandItem())) {
+            phase = WorkPhase.SEARCHING;
             toolPickupPending = false;
         } else if (bestInventoryAxe(citizen) != null) {
+            phase = WorkPhase.EQUIPPING;
             ItemStack axe = citizen.getNpcInventory().removeItemType(bestInventoryAxe(citizen), 1);
             citizen.setItemSlot(EquipmentSlot.MAINHAND, axe);
             toolPickupPending = false;
         } else if (toolPickupPending) {
+            phase = WorkPhase.WAITING_FOR_TOOL;
             if (StorageJob.retrieveBestAxe(citizen, level)) return;
             toolPickupPending = false;
         } else if (toolLookupCooldown > 0) {
             toolLookupCooldown -= 10;
+            if (StorageJob.retrieveBestAxe(citizen, level)) {
+                toolPickupPending = !isAxe(citizen.getMainHandItem());
+                phase = WorkPhase.WAITING_FOR_TOOL;
+                return;
+            }
+            phase = WorkPhase.SEARCHING;
         } else {
+            phase = WorkPhase.WAITING_FOR_TOOL;
             toolLookupCooldown = 100;
             if (StorageJob.retrieveBestAxe(citizen, level)) {
                 toolPickupPending = !isAxe(citizen.getMainHandItem());
@@ -200,31 +255,55 @@ public final class LumberjackJob implements ProfessionJob {
         }
 
         announcedSearching = true;
-        if (lumberjackTarget == null || !isChoppableTreeBlock(level.getBlockState(lumberjackTarget))) {
+        if (lumberjackTarget != null && !isChoppableTreeBlock(level.getBlockState(lumberjackTarget))) {
+            clearCurrentTarget(citizen, level);
+        }
+        if (lumberjackTarget == null && treeSearchCooldown == 0) {
+            phase = WorkPhase.SEARCHING;
             lumberjackTarget = findNearestLog(citizen, level);
+            treeSearchCooldown = TREE_SEARCH_COOLDOWN_TICKS;
             if (lumberjackTarget == null) {
-                if (plantSaplingInTerritory(citizen, level)) return;
+                if (plantSaplingInTerritory(citizen, level)) {
+                    phase = WorkPhase.REFORESTING;
+                    return;
+                }
                 if (firstSaplingSlot(citizen) < 0 && saplingLookupCooldown <= 0) {
                     saplingLookupCooldown = 100;
-                    if (StorageJob.retrieveFirstSapling(citizen, level)) return;
+                    if (StorageJob.retrieveFirstSapling(citizen, level)) {
+                        phase = WorkPhase.WAITING_FOR_SAPLING;
+                        return;
+                    }
                 }
+                phase = WorkPhase.PATROLLING;
                 patrolForWood(citizen, level);
                 return;
             }
+            plannedApproachFor = null;
+            plannedApproach = null;
+            failedApproachFor = null;
+            approachRetryCooldown = 0;
             if (!announcedTreeFound) {
                 citizen.announce("Encontrei uma árvore; vou começar a coleta.");
                 announcedTreeFound = true;
             }
         }
 
+        if (lumberjackTarget == null) {
+            phase = WorkPhase.PATROLLING;
+            patrolForWood(citizen, level);
+            return;
+        }
+
+        phase = WorkPhase.NAVIGATING;
         BlockPos approach = findTreeApproach(citizen, level, lumberjackTarget);
         if (approach == null) {
+            phase = WorkPhase.RECOVERING;
             recoverPathIfStuck(citizen, level);
             return;
         }
         double horizontalDistance = citizen.distanceToSqr(lumberjackTarget.getX() + 0.5, lumberjackTarget.getY() + 0.5,
             lumberjackTarget.getZ() + 0.5);
-        boolean closeEnoughToChop = horizontalDistance <= 20.25;
+        boolean closeEnoughToChop = horizontalDistance <= 9.0;
         if (!closeEnoughToChop || !citizen.getNavigation().isDone()) {
             if (!closeEnoughToChop && (citizen.getNavigation().isDone() || citizen.getNavigation().getTargetPos() == null
                 || !citizen.getNavigation().getTargetPos().equals(approach))) {
@@ -233,6 +312,8 @@ public final class LumberjackJob implements ProfessionJob {
             recoverPathIfStuck(citizen, level);
             return;
         }
+
+        phase = WorkPhase.CHOPPING;
 
         Item targetItem = level.getBlockState(lumberjackTarget).getBlock().asItem();
         if (!citizen.getNpcInventory().canAddItem(new ItemStack(targetItem))) {
@@ -264,6 +345,11 @@ public final class LumberjackJob implements ProfessionJob {
             }
             chopProgress = 0.0f;
             lumberjackTarget = null;
+            plannedApproach = null;
+            plannedApproachFor = null;
+            failedApproachFor = null;
+            approachRetryCooldown = 0;
+            treeSearchCooldown = 0;
             announcedTreeFound = false;
         }
     }
@@ -353,23 +439,48 @@ public final class LumberjackJob implements ProfessionJob {
     }
 
     private BlockPos findTreeApproach(CitizenEntity citizen, ServerLevel level, BlockPos trunk) {
-        BlockPos best = null;
-        double bestDistance = Double.MAX_VALUE;
+        if (trunk.equals(plannedApproachFor) && plannedApproach != null
+            && isSafeApproachPosition(citizen, level, plannedApproach)) return plannedApproach;
+        if (trunk.equals(failedApproachFor) && approachRetryCooldown > 0) return null;
+
+        plannedApproachFor = trunk.immutable();
+        plannedApproach = null;
+        List<ApproachCandidate> candidates = new ArrayList<>();
         for (Direction direction : Direction.Plane.HORIZONTAL) {
             for (int verticalOffset = 1; verticalOffset >= -2; verticalOffset--) {
                 BlockPos feet = trunk.relative(direction).above(verticalOffset);
-                BlockState floor = level.getBlockState(feet.below());
-                if (!citizen.belongsToNation(feet) || !level.getBlockState(feet).getCollisionShape(level, feet).isEmpty()
-                    || !level.getBlockState(feet.above()).getCollisionShape(level, feet.above()).isEmpty()
-                    || !floor.isFaceSturdy(level, feet.below(), Direction.UP)) continue;
+                if (!isSafeApproachPosition(citizen, level, feet)) continue;
                 double distance = citizen.distanceToSqr(feet.getX() + 0.5, feet.getY(), feet.getZ() + 0.5);
-                if (distance < bestDistance) {
-                    bestDistance = distance;
-                    best = feet.immutable();
-                }
+                candidates.add(new ApproachCandidate(feet.immutable(), distance));
             }
         }
-        return best;
+        candidates.sort(Comparator.comparingDouble(ApproachCandidate::distance));
+
+        PathNavigation navigation = citizen.getNavigation();
+        int checked = 0;
+        for (ApproachCandidate candidate : candidates) {
+            Path path = navigation.createPath(candidate.position(), 0);
+            if (path != null && path.canReach()) {
+                plannedApproach = candidate.position();
+                failedApproachFor = null;
+                approachRetryCooldown = 0;
+                return plannedApproach;
+            }
+            if (++checked >= MAX_APPROACH_PATH_CHECKS) break;
+        }
+        failedApproachFor = trunk.immutable();
+        approachRetryCooldown = TREE_SEARCH_COOLDOWN_TICKS;
+        return null;
+    }
+
+    private boolean isSafeApproachPosition(CitizenEntity citizen, ServerLevel level, BlockPos feet) {
+        BlockPos head = feet.above();
+        BlockPos floorPos = feet.below();
+        BlockState floor = level.getBlockState(floorPos);
+        return citizen.belongsToNation(feet) && citizen.belongsToNation(head)
+            && level.getBlockState(feet).getCollisionShape(level, feet).isEmpty()
+            && level.getBlockState(head).getCollisionShape(level, head).isEmpty()
+            && floor.isFaceSturdy(level, floorPos, Direction.UP);
     }
 
     private BlockPos findTreeBase(CitizenEntity citizen, ServerLevel level, BlockPos log) {
@@ -527,12 +638,8 @@ public final class LumberjackJob implements ProfessionJob {
         BlockPos best = null;
         double bestDistance = Double.MAX_VALUE;
         for (BlockPos pos : BlockPos.betweenClosed(origin.offset(-12, -4, -12), origin.offset(12, 32, 12))) {
-            boolean partOfSkippedTree = skippedTreeBase != null && skippedTreeCooldown > 0
-                && Math.abs(pos.getX() - skippedTreeBase.getX()) <= 2
-                && Math.abs(pos.getZ() - skippedTreeBase.getZ()) <= 2
-                && pos.getY() >= skippedTreeBase.getY() && pos.getY() <= skippedTreeBase.getY() + 32;
-            if (level.getBlockState(pos).is(BlockTags.LOGS) && !temporaryTower.contains(pos)
-                && !partOfSkippedTree && citizen.belongsToNation(pos)) {
+            if (isChoppableTreeBlock(level.getBlockState(pos)) && !temporaryTower.contains(pos)
+                && !isInAbandonedTree(pos) && citizen.belongsToNation(pos)) {
                 double distance = citizen.distanceToSqr(pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5);
                 if (distance < bestDistance) { bestDistance = distance; best = pos.immutable(); }
             }
@@ -629,6 +736,7 @@ public final class LumberjackJob implements ProfessionJob {
     }
 
     private void recoverPathIfStuck(CitizenEntity citizen, ServerLevel level) {
+        if (lumberjackTarget == null) return;
         double moved = citizen.distanceToSqr(lastX, lastY, lastZ);
         if (moved < 0.04) stuckTicks++;
         else stuckTicks = 0;
@@ -644,11 +752,30 @@ public final class LumberjackJob implements ProfessionJob {
                 blockingLeaf.getZ() + 0.5, 30.0f, 30.0f);
             citizen.swing(InteractionHand.MAIN_HAND);
             if (level.destroyBlock(blockingLeaf, true, citizen)) {
-                citizen.announce("As folhas estavam bloqueando meu caminho; limpei a passagem e vou continuar até a árvore.");
+                citizen.announce("As folhas bloqueavam o caminho; limpei a passagem.");
+                plannedApproach = null;
+                plannedApproachFor = null;
+                failedApproachFor = null;
+                approachRetryCooldown = 0;
                 BlockPos approach = findTreeApproach(citizen, level, lumberjackTarget);
                 if (approach != null) citizen.getNavigation().moveTo(approach.getX() + 0.5, approach.getY(), approach.getZ() + 0.5, 0.9);
                 return;
             }
+        }
+        BlockPos obstacleTowardTarget = findObstacleTowardTarget(citizen, level, direction);
+        if (obstacleTowardTarget != null) {
+            BlockState state = level.getBlockState(obstacleTowardTarget);
+            citizen.getLookControl().setLookAt(obstacleTowardTarget.getX() + 0.5,
+                obstacleTowardTarget.getY() + 0.5, obstacleTowardTarget.getZ() + 0.5, 30.0f, 30.0f);
+            citizen.swing(InteractionHand.MAIN_HAND);
+            if (level.destroyBlock(obstacleTowardTarget, false, citizen))
+                citizen.announce("Abri um caminho para chegar à árvore.");
+            plannedApproach = null;
+            plannedApproachFor = null;
+            failedApproachFor = null;
+            approachRetryCooldown = 0;
+            citizen.getNavigation().recomputePath();
+            return;
         }
         for (BlockPos obstacle : List.of(front.above(), front.above(2))) {
             BlockState state = level.getBlockState(obstacle);
@@ -668,17 +795,66 @@ public final class LumberjackJob implements ProfessionJob {
             citizen.getNpcInventory().removeItemType(Items.DIRT, 1);
             citizen.announce("Fiquei preso. Estou construindo um degrau de terra para sair.");
             citizen.getJumpControl().jump();
+            plannedApproach = null;
+            plannedApproachFor = null;
+            failedApproachFor = null;
+            approachRetryCooldown = 0;
             citizen.getNavigation().moveTo(step.getX() + 0.5, step.getY() + 1.0, step.getZ() + 0.5, 0.8);
         } else if (countItems(citizen, Items.DIRT) == 0 && collectDirt(citizen, level)) {
             return;
         } else {
-            skippedTreeBase = findTreeBase(citizen, level, lumberjackTarget);
-            skippedTreeCooldown = 200;
-            lumberjackTarget = null;
+            BlockPos blockedBase = findTreeBase(citizen, level, lumberjackTarget);
+            if (blockedBase != null) abandonedTreeBases.put(blockedBase.immutable(), level.getGameTime() + ABANDONED_TREE_TICKS);
+            clearCurrentTarget(citizen, level);
+            treeSearchCooldown = 0;
             announcedTreeFound = false;
             citizen.getNavigation().stop();
-            citizen.announce("Esse caminho para a árvore travou; vou procurar outra rota e continuar trabalhando.");
+            citizen.announce("Não encontrei uma rota segura para essa árvore; vou tentar outra.");
         }
+    }
+
+    private BlockPos findObstacleTowardTarget(CitizenEntity citizen, ServerLevel level, Direction direction) {
+        BlockPos origin = citizen.blockPosition();
+        for (int forward = 1; forward <= 2; forward++) {
+            for (int height = 1; height <= 2; height++) {
+                BlockPos candidate = origin.relative(direction, forward).above(height);
+                BlockState state = level.getBlockState(candidate);
+                if (citizen.belongsToNation(candidate) && !state.isAir() && !state.hasBlockEntity()
+                    && state.getDestroySpeed(level, candidate) >= 0.0f
+                    && (state.is(BlockTags.DIRT) || state.is(BlockTags.LOGS))) return candidate;
+            }
+        }
+        return null;
+    }
+
+    private void clearDestroyProgress(CitizenEntity citizen, ServerLevel level) {
+        if (lumberjackTarget != null) level.destroyBlockProgress(citizen.getId(), lumberjackTarget, -1);
+    }
+
+    private void clearCurrentTarget(CitizenEntity citizen, ServerLevel level) {
+        clearDestroyProgress(citizen, level);
+        lumberjackTarget = null;
+        plannedApproach = null;
+        plannedApproachFor = null;
+        failedApproachFor = null;
+        approachRetryCooldown = 0;
+        chopProgress = 0.0f;
+    }
+
+    private void expireAbandonedTrees(long gameTime) {
+        Iterator<Map.Entry<BlockPos, Long>> iterator = abandonedTreeBases.entrySet().iterator();
+        while (iterator.hasNext()) {
+            if (iterator.next().getValue() <= gameTime) iterator.remove();
+        }
+    }
+
+    private boolean isInAbandonedTree(BlockPos position) {
+        for (BlockPos base : abandonedTreeBases.keySet()) {
+            if (Math.abs(position.getX() - base.getX()) <= 2
+                && Math.abs(position.getZ() - base.getZ()) <= 2
+                && position.getY() >= base.getY() && position.getY() <= base.getY() + MAX_TREE_LOGS) return true;
+        }
+        return false;
     }
 
     private int firstSaplingSlot(CitizenEntity citizen) {
@@ -762,5 +938,30 @@ public final class LumberjackJob implements ProfessionJob {
     private boolean isAxe(ItemStack stack) {
         return stack.is(Items.DIAMOND_AXE) || stack.is(Items.IRON_AXE)
             || stack.is(Items.STONE_AXE) || stack.is(Items.WOODEN_AXE);
+    }
+
+    private record ApproachCandidate(BlockPos position, double distance) {}
+
+    private enum WorkPhase {
+        IDLE,
+        SEARCHING,
+        NAVIGATING,
+        CHOPPING,
+        COLLECTING,
+        DELIVERING,
+        EQUIPPING,
+        WAITING_FOR_TOOL,
+        WAITING_FOR_SAPLING,
+        REFORESTING,
+        PATROLLING,
+        RECOVERING;
+
+        private static WorkPhase fromId(String value) {
+            try {
+                return valueOf(value);
+            } catch (IllegalArgumentException exception) {
+                return SEARCHING;
+            }
+        }
     }
 }
