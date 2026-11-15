@@ -72,8 +72,11 @@ public final class CivilizationData extends SavedData {
         NATION_CODEC.listOf().fieldOf("nations").forGetter(data -> data.nations.values().stream().toList()),
         WAREHOUSE_CODEC.listOf().optionalFieldOf("warehouses", List.of()).forGetter(data -> data.warehouses.values().stream().toList()),
         STORAGE_REQUEST_CODEC.listOf().optionalFieldOf("storageRequests", List.of()).forGetter(data -> data.storageRequests.values().stream().toList()),
-        STORAGER_CLAIM_CODEC.listOf().optionalFieldOf("storagerClaims", List.of()).forGetter(data -> data.storagerClaims.values().stream().toList())
-    ).apply(instance, CivilizationData::new));
+        STORAGER_CLAIM_CODEC.listOf().optionalFieldOf("storagerClaims", List.of()).forGetter(data -> data.storagerClaims.values().stream().toList()),
+        UUIDUtil.CODEC.listOf().optionalFieldOf("warehousePlotRequests", List.of()).forGetter(data -> List.copyOf(data.warehousePlotRequests)),
+        UUIDUtil.CODEC.listOf().optionalFieldOf("preparedWarehousePlots", List.of()).forGetter(data -> List.copyOf(data.preparedWarehousePlots))
+    ).apply(instance, (locations, nations, warehouses, requests, claims, plotRequests, preparedPlots) ->
+        new CivilizationData(locations, nations, warehouses, requests, claims, plotRequests, preparedPlots)));
     public static final SavedDataType<CivilizationData> TYPE = new SavedDataType<>(
         "ai_civilization", CivilizationData::new, CODEC, null
     );
@@ -83,17 +86,21 @@ public final class CivilizationData extends SavedData {
     private final Map<UUID, Warehouse> warehouses = new LinkedHashMap<>();
     private final Map<UUID, StorageRequest> storageRequests = new LinkedHashMap<>();
     private final Map<UUID, StoragerClaim> storagerClaims = new LinkedHashMap<>();
+    private final java.util.Set<UUID> warehousePlotRequests = new java.util.LinkedHashSet<>();
+    private final java.util.Set<UUID> preparedWarehousePlots = new java.util.LinkedHashSet<>();
 
     private CivilizationData() {}
 
     private CivilizationData(List<SavedLocation> locations, List<Nation> nations,
                              List<Warehouse> warehouses, List<StorageRequest> storageRequests,
-                             List<StoragerClaim> storagerClaims) {
+                             List<StoragerClaim> storagerClaims, List<UUID> plotRequests, List<UUID> preparedPlots) {
         locations.forEach(location -> this.locations.put(key(location.name()), location));
         nations.forEach(nation -> this.nations.put(nation.id(), nation));
         warehouses.forEach(warehouse -> this.warehouses.put(warehouse.nationId(), warehouse));
         storageRequests.forEach(request -> this.storageRequests.put(request.id(), request));
         storagerClaims.forEach(claim -> this.storagerClaims.put(claim.nationId(), claim));
+        warehousePlotRequests.addAll(plotRequests);
+        preparedWarehousePlots.addAll(preparedPlots);
     }
 
     public static CivilizationData get(ServerLevel level) {
@@ -174,6 +181,8 @@ public final class CivilizationData extends SavedData {
         if (nations.remove(id) == null) return;
         warehouses.remove(id);
         storagerClaims.remove(id);
+        warehousePlotRequests.remove(id);
+        preparedWarehousePlots.remove(id);
         storageRequests.values().removeIf(request -> request.nationId().equals(id));
         setDirty();
     }
@@ -183,6 +192,18 @@ public final class CivilizationData extends SavedData {
     }
 
     public Warehouse warehouse(UUID nationId) { return warehouses.get(nationId); }
+
+    public boolean warehousePlotRequested(UUID nationId) { return warehousePlotRequests.contains(nationId); }
+    public boolean warehousePlotPrepared(UUID nationId) { return preparedWarehousePlots.contains(nationId); }
+
+    public void requestWarehousePlot(UUID nationId) {
+        if (warehousePlotRequests.add(nationId)) setDirty();
+    }
+
+    public void markWarehousePlotPrepared(UUID nationId) {
+        warehousePlotRequests.remove(nationId);
+        if (preparedWarehousePlots.add(nationId)) setDirty();
+    }
 
     public UUID storager(UUID nationId) {
         StoragerClaim claim = storagerClaims.get(nationId);
@@ -208,6 +229,8 @@ public final class CivilizationData extends SavedData {
         Warehouse warehouse = new Warehouse(nationId, center.getX(), center.getY(), center.getZ(), radius, dimension,
             false, 0, 0, 0);
         warehouses.put(nationId, warehouse);
+        warehousePlotRequests.remove(nationId);
+        preparedWarehousePlots.remove(nationId);
         setDirty();
         return warehouse;
     }
