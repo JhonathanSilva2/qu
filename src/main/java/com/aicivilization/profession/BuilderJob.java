@@ -390,7 +390,7 @@ public final class BuilderJob implements ProfessionJob {
 
         if (primaryStructureBuilder && warehouse != null && data.warehousePlotRequested(citizen.getNationId())
             && !data.warehousePlotPrepared(citizen.getNationId())) {
-            if (!preparingPlot && warehousePlotCursor >= 100) warehousePlotCursor = 0;
+            if (!preparingPlot && warehousePlotCursor >= 121) warehousePlotCursor = 0;
             preparingPlot = true;
             if (cooldown-- > 0) return;
             cooldown = TICK_INTERVAL;
@@ -567,6 +567,7 @@ public final class BuilderJob implements ProfessionJob {
 
             // All 3 lanes of this step are at the same height and paved!
             currentSubTask = "Passo " + (routeStep + 1) + " nivelado (3 faixas em Y=" + targetY + ")";
+            decorateRoadStepFeatures(citizen, level, routeIndex, routeStep, step, targetY, steps.size());
             advanceRouteStep(targetY);
             skippedThisTick++;
         }
@@ -856,6 +857,176 @@ public final class BuilderJob implements ProfessionJob {
         }
         routeStep++;
         stepTargetY = UNSET_Y;
+    }
+
+    private void decorateRoadStepFeatures(CitizenEntity citizen, ServerLevel level, int routeIdx, int stepIdx,
+                                          RoadStep step, int surfaceY, int totalSteps) {
+        if (townCenter == null || surfaceY == UNSET_Y) return;
+        BlockPos centerPos = step.center(surfaceY);
+        int dx = centerPos.getX() - townCenter.getX();
+        int dz = centerPos.getZ() - townCenter.getZ();
+        int distFromCenter = Math.max(Math.abs(dx), Math.abs(dz));
+
+        // 1. Placas de sinalização nos cruzamentos principais
+        if (routeIdx == ROUTE_WAREHOUSE && stepIdx == 0) {
+            // Saída Leste do Centro da Vila
+            BlockPos signPos = step.lanePos(-2, surfaceY);
+            placeDirectionSign(citizen, level, signPos, Direction.WEST,
+                "---> LESTE", "Warehouse", "Mina (Sul)", "");
+        } else if (routeIdx == ROUTE_MINE && stepIdx == 1) {
+            // Bifurcação em "T" para a Mina/Caverna
+            BlockPos signPos = step.lanePos(-2, surfaceY);
+            placeDirectionSign(citizen, level, signPos, Direction.NORTH,
+                "v SUL", "Caverna / Mina", "-> Warehouse", "");
+        } else if (routeIdx >= ROUTE_CARDINAL_FIRST && stepIdx == 0) {
+            BlockPos signPos = step.lanePos(-2, surfaceY);
+            if (routeIdx == ROUTE_CARDINAL_FIRST + 1) {
+                placeDirectionSign(citizen, level, signPos, Direction.NORTH,
+                    "v SUL", "Currais", "Fronteira", "");
+            } else if (routeIdx == ROUTE_CARDINAL_FIRST + 2) {
+                placeDirectionSign(citizen, level, signPos, Direction.EAST,
+                    "<- OESTE", "Reflorestamento", "50x50 (NO)", "");
+            } else if (routeIdx == ROUTE_CARDINAL_FIRST + 3) {
+                placeDirectionSign(citizen, level, signPos, Direction.SOUTH,
+                    "^ NORTE", "Fazenda / Trigo", "Fronteira", "");
+            }
+        }
+
+        // 2. Arcos / Portões estilo Millénaire na entrada e saída das construções, no raio de 30 blocos e na Mina
+        boolean isArchStep = (routeIdx == ROUTE_WAREHOUSE && (stepIdx == 1 || stepIdx == totalSteps - 1))
+            || (routeIdx == ROUTE_MINE && (stepIdx == 1 || (totalSteps > 2 && stepIdx == totalSteps - 2)))
+            || (routeIdx >= ROUTE_CARDINAL_FIRST && distFromCenter == 30);
+        if (isArchStep) {
+            buildMillenaireArch(citizen, level, step, surfaceY);
+            return;
+        }
+
+        // 3. Postes simples com tocha em PARES (ambos os lados) a cada 16 blocos, longe dos arcos
+        boolean nearArch = Math.abs(distFromCenter - 30) < 8 || stepIdx < 6 || (totalSteps > 8 && stepIdx > totalSteps - 6);
+        if (!nearArch && stepIdx % 16 == 0) {
+            buildStreetLamp(citizen, level, step.lanePos(-2, surfaceY));
+            buildStreetLamp(citizen, level, step.lanePos(2, surfaceY));
+        }
+    }
+
+    private void buildStreetLamp(CitizenEntity citizen, ServerLevel level, BlockPos basePos) {
+        if (!level.hasChunkAt(basePos)) return;
+        fillFoundationDown(level, basePos.below(), Blocks.COBBLESTONE);
+        citizen.getLookControl().setLookAt(basePos.getX() + 0.5, basePos.getY() + 2.0, basePos.getZ() + 0.5);
+        citizen.swing(net.minecraft.world.InteractionHand.MAIN_HAND);
+        for (int i = 0; i < 3; i++) {
+            BlockPos fencePos = basePos.above(i);
+            if ((level.getBlockState(fencePos).isAir() || level.getBlockState(fencePos).canBeReplaced())
+                && consumeItem(citizen, Items.OAK_FENCE)) {
+                level.setBlockAndUpdate(fencePos, Blocks.OAK_FENCE.defaultBlockState());
+            }
+        }
+        BlockPos torchPos = basePos.above(3);
+        if (level.getBlockState(torchPos).isAir() || level.getBlockState(torchPos).canBeReplaced()) {
+            if (consumeItem(citizen, Items.TORCH)) {
+                level.setBlockAndUpdate(torchPos, Blocks.TORCH.defaultBlockState());
+            } else {
+                requestResourceOnce(citizen, level, Items.TORCH, 8);
+            }
+        }
+    }
+
+    private void buildMillenaireArch(CitizenEntity citizen, ServerLevel level, RoadStep step, int surfaceY) {
+        BlockPos leftBase = step.lanePos(-2, surfaceY);
+        BlockPos rightBase = step.lanePos(2, surfaceY);
+        if (!level.hasChunkAt(leftBase) || !level.hasChunkAt(rightBase)) return;
+
+        citizen.getLookControl().setLookAt(step.x() + 0.5, surfaceY + 3.0, step.z() + 0.5);
+        citizen.swing(net.minecraft.world.InteractionHand.MAIN_HAND);
+
+        // Pilares laterais (altura 4) fora da pista de 3 blocos, com fundação até o chão firme.
+        // Usa STONE_BRICKS (nunca OAK_LOG) para que o Lenhador jamais confunda a pilastra com uma árvore!
+        for (BlockPos pillarBase : new BlockPos[]{leftBase, rightBase}) {
+            fillFoundationDown(level, pillarBase.below(), Blocks.COBBLESTONE);
+            for (int y = 0; y < 4; y++) {
+                if (consumeItem(citizen, Items.STONE_BRICKS)) {
+                    level.setBlockAndUpdate(pillarBase.above(y), Blocks.STONE_BRICKS.defaultBlockState());
+                } else {
+                    requestResourceOnce(citizen, level, Items.STONE_BRICKS, 16);
+                }
+            }
+        }
+
+        // Travessa superior em Y+3 e laje de acabamento em Y+4 (vão livre 3x3)
+        for (int lane = -2; lane <= 2; lane++) {
+            BlockPos beamPos = step.lanePos(lane, surfaceY + 3);
+            Item plank = findInventoryItem(citizen, ItemTags.PLANKS);
+            if (plank != null && consumeItem(citizen, plank)) {
+                level.setBlockAndUpdate(beamPos, Block.byItem(plank).defaultBlockState());
+            } else {
+                requestResourceOnce(citizen, level, Items.OAK_PLANKS, 16);
+            }
+            if (lane >= -1 && lane <= 1 && consumeItem(citizen, Items.OAK_SLAB)) {
+                level.setBlockAndUpdate(beamPos.above(), Blocks.OAK_SLAB.defaultBlockState());
+            }
+        }
+
+        // Tochas de iluminação no topo dos pilares (apenas se houver tocha real no inventário)
+        for (BlockPos torchPos : new BlockPos[]{leftBase.above(4), rightBase.above(4)}) {
+            if (consumeItem(citizen, Items.TORCH)) {
+                level.setBlockAndUpdate(torchPos, Blocks.TORCH.defaultBlockState());
+            } else {
+                requestResourceOnce(citizen, level, Items.TORCH, 8);
+            }
+        }
+    }
+
+    private void requestResourceOnce(CitizenEntity citizen, ServerLevel level, Item item, int amount) {
+        if (citizen.getNationId() == null) return;
+        CivilizationData data = CivilizationData.get(level);
+        String reqId = StorageJob.resourceRequestId(item);
+        if (!hasOpenResourceRequest(data, citizen, reqId)) {
+            requestResource(citizen, level, item, amount);
+        }
+    }
+
+    private static void fillFoundationDown(ServerLevel level, BlockPos start, Block block) {
+        BlockPos cursor = start;
+        for (int depth = 0; depth < 10 && cursor.getY() > level.getMinY() + 1; depth++) {
+            BlockState state = level.getBlockState(cursor);
+            if (!state.isAir() && state.getFluidState().isEmpty() && state.isFaceSturdy(level, cursor, Direction.UP)) {
+                break;
+            }
+            level.setBlockAndUpdate(cursor, block.defaultBlockState());
+            cursor = cursor.below();
+        }
+    }
+
+    private void placeDirectionSign(CitizenEntity citizen, ServerLevel level, BlockPos signPos, Direction facing,
+                                    String line1, String line2, String line3, String line4) {
+        if (!level.hasChunkAt(signPos)) return;
+        BlockPos support = signPos.below();
+        if (level.getBlockState(support).isAir() || !level.getFluidState(support).isEmpty()) {
+            level.setBlockAndUpdate(support, Blocks.DIRT.defaultBlockState());
+        }
+        if (!level.getBlockState(signPos).isAir() && !level.getBlockState(signPos).canBeReplaced()) return;
+
+        citizen.getLookControl().setLookAt(signPos.getX() + 0.5, signPos.getY() + 0.5, signPos.getZ() + 0.5);
+        citizen.swing(net.minecraft.world.InteractionHand.MAIN_HAND);
+        int rotation = switch (facing) {
+            case SOUTH -> 0;
+            case WEST -> 4;
+            case NORTH -> 8;
+            case EAST -> 12;
+            default -> 0;
+        };
+        BlockState signState = Blocks.OAK_SIGN.defaultBlockState()
+            .setValue(net.minecraft.world.level.block.StandingSignBlock.ROTATION, rotation);
+        level.setBlockAndUpdate(signPos, signState);
+        if (level.getBlockEntity(signPos) instanceof net.minecraft.world.level.block.entity.SignBlockEntity signBe) {
+            net.minecraft.world.level.block.entity.SignText text = new net.minecraft.world.level.block.entity.SignText()
+                .setMessage(0, net.minecraft.network.chat.Component.literal(line1))
+                .setMessage(1, net.minecraft.network.chat.Component.literal(line2))
+                .setMessage(2, net.minecraft.network.chat.Component.literal(line3))
+                .setMessage(3, net.minecraft.network.chat.Component.literal(line4));
+            signBe.setText(text, true);
+            signBe.setChanged();
+        }
     }
 
     private void finishCurrentRoute(CitizenEntity citizen) {
@@ -1192,10 +1363,10 @@ public final class BuilderJob implements ProfessionJob {
         }
 
         // Convert any logs in inventory into planks if needed later, or keep dirt ready
-        // PHASE 1: Cut elevated terrain, trees, and surface foliage across the entire 10x10 first!
-        for (int idx = 0; idx < 100; idx++) {
-            int x = warehouse.x() - 5 + idx % 10;
-            int z = warehouse.z() - 5 + idx / 10;
+        // PHASE 1: Cut elevated terrain, trees, and surface foliage across the entire 11x11 first!
+        for (int idx = 0; idx < 121; idx++) {
+            int x = warehouse.x() - 5 + idx % 11;
+            int z = warehouse.z() - 5 + idx / 11;
             BlockPos probe = new BlockPos(x, warehouse.y(), z);
             if (!citizen.isInsideNation(probe) || !level.hasChunkAt(probe)) continue;
 
@@ -1500,7 +1671,7 @@ public final class BuilderJob implements ProfessionJob {
 
     private static GridBlueprint villageCenterBlueprint(ServerLevel level) {
         if (VILLAGE_CENTER_BLUEPRINT == null)
-            VILLAGE_CENTER_BLUEPRINT = GridBlueprint.load(level, "village_center_10x10");
+            VILLAGE_CENTER_BLUEPRINT = GridBlueprint.load(level, "village_center_11x11");
         return VILLAGE_CENTER_BLUEPRINT;
     }
 

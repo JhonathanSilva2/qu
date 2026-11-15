@@ -12,13 +12,13 @@ import com.mojang.blaze3d.vertex.PoseStack;
 import net.minecraft.ChatFormatting;
 import net.minecraft.client.KeyMapping;
 import org.lwjgl.glfw.GLFW;
-import net.minecraft.client.model.PlayerModel;
+import net.minecraft.client.model.HumanoidModel;
 import net.minecraft.client.model.geom.ModelLayers;
 import net.minecraft.client.renderer.SubmitNodeCollector;
 import net.minecraft.client.renderer.entity.EntityRenderers;
 import net.minecraft.client.renderer.entity.EntityRendererProvider;
 import net.minecraft.client.renderer.entity.HumanoidMobRenderer;
-import net.minecraft.client.renderer.entity.state.AvatarRenderState;
+import net.minecraft.client.renderer.entity.state.HumanoidRenderState;
 import net.minecraft.client.renderer.state.CameraRenderState;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceLocation;
@@ -85,14 +85,19 @@ public class AICivilizationClient implements ClientModInitializer {
         };
     }
 
-    private static final class CitizenRenderer extends HumanoidMobRenderer<CitizenEntity, AvatarRenderState, PlayerModel> {
+    private static final class CitizenRenderState extends HumanoidRenderState {
+        public ResourceLocation texture = CITIZEN_TEXTURE;
+        public Component scoreText;
+    }
+
+    private static final class CitizenRenderer extends HumanoidMobRenderer<CitizenEntity, CitizenRenderState, HumanoidModel<CitizenRenderState>> {
         private CitizenRenderer(EntityRendererProvider.Context context) {
-            super(context, new PlayerModel(context.bakeLayer(ModelLayers.PLAYER), false), 0.5f);
+            super(context, new HumanoidModel<>(context.bakeLayer(ModelLayers.PLAYER)), 0.5f);
         }
 
         @Override
-        public AvatarRenderState createRenderState() {
-            return new AvatarRenderState();
+        public CitizenRenderState createRenderState() {
+            return new CitizenRenderState();
         }
 
         @Override
@@ -101,14 +106,9 @@ public class AICivilizationClient implements ClientModInitializer {
         }
 
         @Override
-        public void extractRenderState(CitizenEntity citizen, AvatarRenderState state, float partialTick) {
+        public void extractRenderState(CitizenEntity citizen, CitizenRenderState state, float partialTick) {
             super.extractRenderState(citizen, state, partialTick);
-            state.showHat = true;
-            state.showJacket = true;
-            state.showLeftPants = true;
-            state.showRightPants = true;
-            state.showLeftSleeve = true;
-            state.showRightSleeve = true;
+            state.texture = getTextureForProfession(citizen.getProfessionId());
             String workStatus = citizen.getSyncedWorkStatus();
             if (workStatus != null && !workStatus.isBlank()) {
                 ChatFormatting color = workStatus.startsWith("Aguardando")
@@ -122,7 +122,7 @@ public class AICivilizationClient implements ClientModInitializer {
         }
 
         @Override
-        protected void submitNameTag(AvatarRenderState state, PoseStack poseStack, SubmitNodeCollector collector, CameraRenderState cameraState) {
+        protected void submitNameTag(CitizenRenderState state, PoseStack poseStack, SubmitNodeCollector collector, CameraRenderState cameraState) {
             if (state.nameTag == null) return;
             poseStack.pushPose();
             if (state.scoreText != null && state.distanceToCameraSq < 1024.0) {
@@ -152,9 +152,8 @@ public class AICivilizationClient implements ClientModInitializer {
         }
 
         @Override
-        public ResourceLocation getTextureLocation(AvatarRenderState state) {
-            ResourceLocation tex = ENTITY_TEXTURES.get(state.id);
-            return tex != null ? tex : CITIZEN_TEXTURE;
+        public ResourceLocation getTextureLocation(CitizenRenderState state) {
+            return state.texture != null ? state.texture : CITIZEN_TEXTURE;
         }
     }
 }
