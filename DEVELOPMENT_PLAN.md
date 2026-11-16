@@ -187,18 +187,25 @@ O repositório antigo é um bot Mineflayer para Minecraft 1.20.6, conectado ao s
 - [ ] Atualizar `/aiciv help` à medida que novos comandos forem adicionados.
 - [ ] Documentar os comandos e limitações confirmadas no jogo.
 
-### 5. Backlog de Funcionalidades e Ideias (Detalhes em `docs/ideas.md`)
+### 5. Roadmap Evolutivo: Sobrevivência, Sociedade & O Rei Demônio (Ver `docs/game_design_vision.md`)
 
-- [ ] **Visualização de Limites da Nação:** Exibição clara de bordas/fronteiras (partículas de contorno circular/raio da nação, feedback no chat/ActionBar ou marcos físicos).
-- [ ] **Skins Dedicadas por Profissão:** Vincular as texturas em `textures/entity/` (`builder.png`, `farmer.png`, `explorer.png`, `fisherman.png`, `hunter.png`, `guard.png`, `lumberjack.png`, `miner.png`, `storager.png`) no `CitizenEntityRenderer`.
-- [ ] **Mural de Necessidades de Recursos:** Placas ou quadro de avisos dinâmico no armazém/centro indicando o que a nação precisa no momento (com interação para o jogador entregar itens).
-- [ ] **Novas Profissões:**
-  - [ ] Construtor (`builder`): Reparos, construções baseadas em blueprints, cercamento e pavimentação.
-  - [ ] Fazendeiro (`farmer`): Plantações e criação de animais.
-  - [ ] Explorador (`explorer`): Mapeamento, busca de biomas e cavernas.
-  - [ ] Pescador (`fisherman`): Pesca e abastecimento de peixes/alimentos aquáticos.
-  - [ ] Caçador (`hunter`): Caça de animais para carne, couro e penas.
-  - [ ] Guarda (`guard`): Patrulha e proteção armada contra monstros.
+- [x] **Skins Dedicadas por Profissão:** Texturas em `textures/entity/` totalmente integradas e ativas no `CitizenEntityRenderer` com base em `getProfessionId()` e indicador de trabalho flutuante (`⚙ status`).
+- [x] **Sistema de Blueprints 3D & Fila de Obras:** Builder com suporte a camadas Y, exportador no jogo (`pos1`/`pos2`/`export`) e tela de fila acessível via tecla `K`.
+- [ ] **Passo 1 — Visualização no Mundo dos Limites da Nação:**
+  - Partículas visuais de contorno na fronteira circular de 128 blocos (`/aiciv nation border`).
+  - Alerta no ActionBar ao atravessar a fronteira (*"Entrando em [Nação]"* / *"Saindo..."*).
+- [ ] **Passo 2 — Instintos Survival do Cidadão (Fome & Auto-preservação):**
+  - Barra de fome decrescente; instinto de consumir alimentos do inventário ou pedir ração ao armazém.
+  - Auto-preservação: refúgio temporário se surpreendido pela noite, fuga de Creepers e cura por saturação.
+- [ ] **Passo 3 — Suprimento & Defesa (Fazendeiro e Guarda):**
+  - `FarmerJob`: cultivo de trigo/legumes para suprir comida no armazém.
+  - `GuardJob`: patrulha perimetral com espada/escudo e combate a monstros hostis.
+- [ ] **Passo 4 — Política, Moral e Facções Renegadas:**
+  - Medidor de Moral comunitária (influenciado por fome, segurança e perdas).
+  - Cisma social: cidadãos desesperados desertam à noite e fundam acampamentos renegados fora das leis da nação.
+- [ ] **Passo 5 — Ameaça Global do Rei Demônio:**
+  - Incursões periódicas por fendas dimensionais na fronteira.
+  - Captura de cidadãos caídos para servidão no The End e necessidade de cooperação entre nações.
 
 
 ## Registro de testes
