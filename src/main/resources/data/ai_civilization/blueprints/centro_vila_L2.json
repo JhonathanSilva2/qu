@@ -1,0 +1,24 @@
+{
+  "width": 11,
+  "depth": 11,
+  "height": 1,
+  "legend": {
+    "x": "empty",
+    "A": "minecraft:cobblestone_wall"
+  },
+  "layers": [
+    [
+      "xxxxAxxAxxx",
+      "xxxxxxxxxxx",
+      "xxxxxxxxxxx",
+      "AxxxxxxxxxA",
+      "xxxxxxxxxxx",
+      "xxxxxAxxxxx",
+      "xxxxxxxxxxx",
+      "AxxxxxxxxxA",
+      "xxxxxxxxxxx",
+      "xxxxxxxxxxx",
+      "xxxxAxxAxxx"
+    ]
+  ]
+}

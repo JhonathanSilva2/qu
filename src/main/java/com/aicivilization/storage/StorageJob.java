@@ -164,7 +164,7 @@ public final class StorageJob implements ProfessionJob {
                 int z = nation.z() + direction[1] * distance;
                 BlockPos probe = new BlockPos(x, nation.y(), z);
                 if (!level.hasChunkAt(probe)) continue;
-                int optimalY = computeOptimalWarehouseSurfaceY(level, x, z, nation.y());
+                int optimalY = nation.y();
                 BlockPos candidate = new BlockPos(x, optimalY, z);
                 if (!outsideStandardExclusion(candidate, nation)) continue;
                 if (!nation.contains(candidate.offset(10, 0, 0)) || !nation.contains(candidate.offset(-10, 0, 0))

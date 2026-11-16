@@ -81,6 +81,25 @@ public final class LumberjackJob implements ProfessionJob {
     private UUID currentDropTargetId;
     private int dropChaseTicks;
     private WorkPhase phase = WorkPhase.SEARCHING;
+    private int activeQuadrant = 0; // 0=NL, 1=NO, 2=SL, 3=SO
+
+    private static String quadrantName(int q) {
+        return switch (q) {
+            case 0 -> "NL";
+            case 1 -> "NO";
+            case 2 -> "SL";
+            default -> "SO";
+        };
+    }
+
+    private static boolean isInQuadrant(int dx, int dz, int q) {
+        return switch (q) {
+            case 0 -> dx >= 0 && dz <= 0; // NL
+            case 1 -> dx <= 0 && dz <= 0; // NO
+            case 2 -> dx >= 0 && dz >= 0; // SL
+            default -> dx <= 0 && dz >= 0; // SO
+        };
+    }
 
     @Override
     public String getId() {
@@ -542,9 +561,14 @@ public final class LumberjackJob implements ProfessionJob {
             patrolIndex++;
             if (patrolIndex >= patrolPoints.size()) {
                 patrolIndex = 0;
-                if (sweepLogCount == 0) citizen.announce("Completei uma ronda pelo território e vou continuar procurando madeira.");
-                else citizen.announce("Completei uma ronda e coletei " + sweepLogCount + " troncos.");
+                String finishedQ = quadrantName(activeQuadrant);
+                activeQuadrant = (activeQuadrant + 1) % 4;
+                patrolPoints = List.of(); // força gerar a rota do próximo quadrante
+                if (sweepLogCount == 0) citizen.announce("Explorei todo o quadrante " + finishedQ + " sem encontrar árvores; avançando para " + quadrantName(activeQuadrant) + ".");
+                else citizen.announce("Concluí o quadrante " + finishedQ + " (" + sweepLogCount + " troncos); avançando para " + quadrantName(activeQuadrant) + ".");
                 sweepLogCount = 0;
+                refreshPatrolPoints(citizen, level);
+                if (patrolPoints.isEmpty()) return;
             }
             target = patrolPoints.get(patrolIndex);
             distance = citizen.distanceToSqr(target.getX() + 0.5, citizen.getY(), target.getZ() + 0.5);
@@ -575,6 +599,7 @@ public final class LumberjackJob implements ProfessionJob {
             int endX = row % 2 == 0 ? radius : -radius;
             int step = row % 2 == 0 ? spacing : -spacing;
             for (int xOffset = startX; row % 2 == 0 ? xOffset <= endX : xOffset >= endX; xOffset += step) {
+                if (!isInQuadrant(xOffset, zOffset, activeQuadrant)) continue;
                 long distanceSquared = (long) xOffset * xOffset + (long) zOffset * zOffset;
                 if (distanceSquared > (long) radius * radius) continue;
                 int x = nation.x() + xOffset;
@@ -1022,10 +1047,18 @@ public final class LumberjackJob implements ProfessionJob {
         return (long) dx * dx + (long) dz * dz >= 30L * 30L;
     }
 
+    public static boolean isInsideReforestationArea(CivilizationData.Nation nation, BlockPos position) {
+        int relX = position.getX() - nation.x();
+        int relZ = position.getZ() - nation.z();
+        // 50x50 reforestation zone in the Northwest quadrant, outside the 30-block inner radius
+        return relX >= -80 && relX <= -31 && relZ >= -80 && relZ <= -31;
+    }
+
     private boolean isInsideExcludedPlantingArea(CitizenEntity citizen, BlockPos position, ServerLevel level) {
         CivilizationData data = CivilizationData.get(level);
         CivilizationData.Nation nation = data.getNation(citizen.getNationId());
         if (nation == null) return true;
+        if (!isInsideReforestationArea(nation, position)) return true;
         long dx = (long) position.getX() - nation.x();
         long dz = (long) position.getZ() - nation.z();
         // 30-block inner radius around Village Center: never replant saplings here!
