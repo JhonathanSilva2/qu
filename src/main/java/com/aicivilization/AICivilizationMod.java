@@ -106,9 +106,11 @@ public class AICivilizationMod implements ModInitializer {
                 content = "Você está fora do território de uma civilização.";
             } else {
                 List<CivilizationData.StorageRequest> requests = data.openStorageRequests(nation.id());
-                content = requests.isEmpty() ? "Nenhum pedido pendente para o Storager."
+                String storagePart = requests.isEmpty() ? "Nenhum pedido pendente para o Storager."
                     : requests.stream().map(request -> formatStorageRequest(level, request)).limit(64)
                         .collect(java.util.stream.Collectors.joining("\n"));
+                String buildingsPart = formatConstructionQueue(level, data, nation);
+                content = storagePart + "\n---BUILDINGS---\n" + buildingsPart;
             }
             ServerPlayNetworking.send(player, new StorageQueuePayload(true, content));
         });
@@ -230,8 +232,151 @@ public class AICivilizationMod implements ModInitializer {
                 .then(Commands.literal("nation")
                     .executes(context -> showNearestNation(context.getSource().getPlayerOrException()))
                     .then(Commands.literal("size")
-                        .executes(context -> showNationSize(context.getSource()))))));
+                        .executes(context -> showNationSize(context.getSource()))))
+                .then(Commands.literal("pos1")
+                    .executes(context -> setExportPos1(context.getSource().getPlayerOrException())))
+                .then(Commands.literal("pos2")
+                    .executes(context -> setExportPos2(context.getSource().getPlayerOrException())))
+                .then(Commands.literal("export")
+                    .then(Commands.argument("nome", StringArgumentType.word())
+                        .executes(context -> exportBlueprint(context.getSource().getPlayerOrException(), getString(context, "nome")))))));
         LOGGER.info("AI Civilization inicializado para Minecraft 1.21.10");
+    }
+
+    private static final java.util.Map<UUID, BlockPos> EXPORT_POS1 = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.Map<UUID, BlockPos> EXPORT_POS2 = new java.util.concurrent.ConcurrentHashMap<>();
+
+    private static int setExportPos1(ServerPlayer player) {
+        BlockPos pos = player.blockPosition().immutable();
+        EXPORT_POS1.put(player.getUUID(), pos);
+        player.sendSystemMessage(Component.literal("[AICiv] pos1 marcada em " + pos.toShortString()).withStyle(ChatFormatting.GREEN));
+        return 1;
+    }
+
+    private static int setExportPos2(ServerPlayer player) {
+        BlockPos pos = player.blockPosition().immutable();
+        EXPORT_POS2.put(player.getUUID(), pos);
+        player.sendSystemMessage(Component.literal("[AICiv] pos2 marcada em " + pos.toShortString()).withStyle(ChatFormatting.GREEN));
+        return 1;
+    }
+
+    private static int exportBlueprint(ServerPlayer player, String name) {
+        BlockPos p1 = EXPORT_POS1.get(player.getUUID());
+        BlockPos p2 = EXPORT_POS2.get(player.getUUID());
+        if (p1 == null || p2 == null) {
+            player.sendSystemMessage(Component.literal("[AICiv] Marque /aiciv pos1 e /aiciv pos2 antes de exportar.").withStyle(ChatFormatting.RED));
+            return 0;
+        }
+        int minX = Math.min(p1.getX(), p2.getX());
+        int maxX = Math.max(p1.getX(), p2.getX());
+        int minY = Math.min(p1.getY(), p2.getY());
+        int maxY = Math.max(p1.getY(), p2.getY());
+        int minZ = Math.min(p1.getZ(), p2.getZ());
+        int maxZ = Math.max(p1.getZ(), p2.getZ());
+        int width = maxX - minX + 1;
+        int height = maxY - minY + 1;
+        int depth = maxZ - minZ + 1;
+        if (width * height * depth > 32768) {
+            player.sendSystemMessage(Component.literal("[AICiv] Área muito grande (máximo 32.768 blocos).").withStyle(ChatFormatting.RED));
+            return 0;
+        }
+
+        String paletteChars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwyz0123456789";
+        java.util.Map<String, Character> blockToChar = new java.util.LinkedHashMap<>();
+        java.util.Map<Character, String> legend = new java.util.LinkedHashMap<>();
+        legend.put('x', "empty");
+        int nextCharIdx = 0;
+
+        ServerLevel level = (ServerLevel) player.level();
+        com.google.gson.JsonArray layersArray = new com.google.gson.JsonArray();
+        for (int y = minY; y <= maxY; y++) {
+            com.google.gson.JsonArray rowArray = new com.google.gson.JsonArray();
+            for (int z = minZ; z <= maxZ; z++) {
+                StringBuilder row = new StringBuilder(width);
+                for (int x = minX; x <= maxX; x++) {
+                    var state = level.getBlockState(new BlockPos(x, y, z));
+                    if (state.isAir()) {
+                        row.append('x');
+                        continue;
+                    }
+                    String blockId = net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
+                    Character ch = blockToChar.get(blockId);
+                    if (ch == null) {
+                        if (nextCharIdx >= paletteChars.length()) {
+                            ch = '?';
+                        } else {
+                            ch = paletteChars.charAt(nextCharIdx++);
+                            blockToChar.put(blockId, ch);
+                            legend.put(ch, blockId);
+                        }
+                    }
+                    row.append(ch);
+                }
+                rowArray.add(row.toString());
+            }
+            layersArray.add(rowArray);
+        }
+
+        com.google.gson.JsonObject root = new com.google.gson.JsonObject();
+        root.addProperty("width", width);
+        root.addProperty("depth", depth);
+        root.addProperty("height", height);
+        com.google.gson.JsonObject legendObj = new com.google.gson.JsonObject();
+        for (var entry : legend.entrySet()) {
+            legendObj.addProperty(String.valueOf(entry.getKey()), entry.getValue());
+        }
+        root.add("legend", legendObj);
+        root.add("layers", layersArray);
+
+        String safeName = name.replaceAll("[^a-zA-Z0-9_\\-]", "_");
+        java.nio.file.Path outDir = java.nio.file.Path.of("config", "ai_civilization", "blueprints");
+        java.nio.file.Path outFile = outDir.resolve(safeName + ".json");
+        try {
+            java.nio.file.Files.createDirectories(outDir);
+            String json = new com.google.gson.GsonBuilder().setPrettyPrinting().create().toJson(root);
+            java.nio.file.Files.writeString(outFile, json, java.nio.charset.StandardCharsets.UTF_8);
+            player.sendSystemMessage(Component.literal("[AICiv] Blueprint exportado (" + width + "x" + height + "x" + depth + ") em: " + outFile.toAbsolutePath()).withStyle(ChatFormatting.GREEN));
+            return 1;
+        } catch (java.io.IOException e) {
+            player.sendSystemMessage(Component.literal("[AICiv] Erro ao salvar blueprint: " + e.getMessage()).withStyle(ChatFormatting.RED));
+            return 0;
+        }
+    }
+
+    private static String formatConstructionQueue(ServerLevel level, CivilizationData data, CivilizationData.Nation nation) {
+        List<String> lines = new ArrayList<>();
+        List<CitizenEntity> builders = new ArrayList<>();
+        for (UUID id : nation.citizens()) {
+            if (level.getEntity(id) instanceof CitizenEntity citizen && citizen.isBuilderEnabled()) {
+                builders.add(citizen);
+            }
+        }
+        if (builders.isEmpty()) {
+            lines.add("Nenhum Builder ativo nesta civilização.");
+            return String.join("\n", lines);
+        }
+        for (CitizenEntity builder : builders) {
+            lines.add("• Builder: " + builder.getPersonalName() + " — " + builder.currentWorkStatus(level));
+        }
+        lines.add("• Centro da Vila: Praça 7x5 / L1");
+        if (data.warehousePlotPrepared(nation.id())) {
+            lines.add("• Warehouse 10x10: Piso pronto");
+        } else if (data.warehousePlotRequested(nation.id())) {
+            lines.add("• Warehouse 10x10: Em preparação");
+        } else {
+            lines.add("• Warehouse 10x10: Aguardando solicitação");
+        }
+        List<CivilizationData.StorageRequest> builderReqs = data.openStorageRequests(nation.id()).stream()
+            .filter(r -> builders.stream().anyMatch(b -> b.getUUID().equals(r.requesterId())))
+            .toList();
+        if (builderReqs.isEmpty()) {
+            lines.add("• Materiais pendentes: Nenhum");
+        } else {
+            for (CivilizationData.StorageRequest req : builderReqs) {
+                lines.add("• Pedido: " + formatStorageRequest(level, req));
+            }
+        }
+        return String.join("\n", lines);
     }
 
     private static String formatStorageRequest(ServerLevel level, CivilizationData.StorageRequest request) {

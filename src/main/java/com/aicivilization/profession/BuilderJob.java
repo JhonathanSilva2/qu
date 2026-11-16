@@ -70,6 +70,8 @@ public final class BuilderJob implements ProfessionJob {
     private BlockPos townCenter;
     private int warehousePlotCursor;
     private int plazaCursor;
+    private int inner30Cursor;
+    private boolean inner30Done;
     private String pendingResourceId = "";
     private boolean shovelRequestSent;
     private boolean pickaxeRequestSent;
@@ -257,6 +259,8 @@ public final class BuilderJob implements ProfessionJob {
         output.putInt("BuilderActionsSinceRepair", actionsSinceRepair);
         output.putInt("BuilderReforestationCursor", reforestationCursor);
         output.putBoolean("BuilderReforestationDone", reforestationDone);
+        output.putInt("BuilderInner30Cursor", inner30Cursor);
+        output.putBoolean("BuilderInner30Done", inner30Done);
     }
 
     public void load(ValueInput input) {
@@ -292,6 +296,8 @@ public final class BuilderJob implements ProfessionJob {
         actionsSinceRepair = Math.max(0, input.getIntOr("BuilderActionsSinceRepair", 0));
         reforestationCursor = Math.max(0, Math.min(2500, input.getIntOr("BuilderReforestationCursor", 0)));
         reforestationDone = input.getBooleanOr("BuilderReforestationDone", false);
+        inner30Cursor = Math.max(0, Math.min(14641, input.getIntOr("BuilderInner30Cursor", 0)));
+        inner30Done = input.getBooleanOr("BuilderInner30Done", false);
         repairTarget = null;
         repairAttempts = 0;
     }
@@ -301,6 +307,94 @@ public final class BuilderJob implements ProfessionJob {
     }
 
     public boolean isInitialized() { return townCenter != null; }
+
+    private static final int[][] INNER_60_OFFSETS = buildInner60Offsets();
+
+    private static int[][] buildInner60Offsets() {
+        java.util.List<int[]> list = new java.util.ArrayList<>();
+        for (int dx = -60; dx <= 60; dx++) {
+            for (int dz = -60; dz <= 60; dz++) {
+                if (dx * dx + dz * dz <= 3600) {
+                    list.add(new int[]{dx, dz});
+                }
+            }
+        }
+        // True circular spiral: sort by radius ring first, then by angle around the center so the Builder walks smoothly in circles!
+        list.sort(java.util.Comparator
+            .comparingInt((int[] a) -> (int) Math.round(Math.sqrt(a[0] * a[0] + a[1] * a[1])))
+            .thenComparingDouble(a -> Math.atan2(a[1], a[0])));
+        return list.toArray(new int[0][]);
+    }
+
+    private boolean prepareInner30RadiusStep(CitizenEntity citizen, ServerLevel level, CivilizationData data, boolean reverseFromEdge) {
+        if (townCenter == null) return false;
+        CivilizationData.MineSite mine = data.getMineSite(citizen.getNationId());
+        CivilizationData.Warehouse warehouse = data.warehouse(citizen.getNationId());
+        int targetGroundY = townCenter.getY() - 1;
+        while (reverseFromEdge ? inner30Cursor >= 0 : inner30Cursor < INNER_60_OFFSETS.length) {
+            int dx = INNER_60_OFFSETS[inner30Cursor][0];
+            int dz = INNER_60_OFFSETS[inner30Cursor][1];
+            int x = townCenter.getX() + dx;
+            int z = townCenter.getZ() + dz;
+            BlockPos probe = new BlockPos(x, townCenter.getY(), z);
+            if (!citizen.isInsideNation(probe) || !level.hasChunkAt(probe)
+                || isInsidePlazaOrWarehouse(probe, warehouse)) {
+                inner30Cursor += reverseFromEdge ? -1 : 1;
+                continue;
+            }
+            // Never level or fill the Miner's mine site!
+            if (mine != null && mine.dimension().equals(level.dimension().location())
+                && mine.origin().distSqr(probe) <= 36.0) {
+                inner30Cursor += reverseFromEdge ? -1 : 1;
+                continue;
+            }
+            // Clear vegetation/logs above targetGroundY
+            for (int clearY = targetGroundY + 1; clearY <= targetGroundY + 4; clearY++) {
+                BlockPos abovePos = new BlockPos(x, clearY, z);
+                BlockState aboveState = level.getBlockState(abovePos);
+                if (aboveState.is(BlockTags.LOGS) || isMushroomBlock(aboveState)) {
+                    if (citizen.distanceToSqr(x + 0.5, citizen.getY(), z + 0.5) > 36.0) {
+                        CitizenEntity.moveTowards(citizen, level, x + 0.5, citizen.getY(), z + 0.5, 1.0);
+                        return true;
+                    }
+                    clearConnectedTreeInPlot(citizen, level, abovePos);
+                    return true;
+                }
+                if (!aboveState.isAir() && isClearableVegetation(aboveState) && level.getFluidState(abovePos).isEmpty()) {
+                    level.destroyBlock(abovePos, true, citizen);
+                }
+            }
+            int currentGroundY = getTrueRoadSurfaceY(level, x, z) - 1;
+            BlockPos currentGround = new BlockPos(x, currentGroundY, z);
+            BlockState topState = level.getBlockState(currentGround);
+            if (currentGroundY > targetGroundY && level.getFluidState(currentGround).isEmpty()
+                && !topState.hasBlockEntity() && topState.getDestroySpeed(level, currentGround) >= 0.0f) {
+                if (citizen.distanceToSqr(x + 0.5, citizen.getY(), z + 0.5) > 36.0) {
+                    CitizenEntity.moveTowards(citizen, level, x + 0.5, citizen.getY(), z + 0.5, 1.0);
+                    return true;
+                }
+                boolean isDirtLike = topState.is(BlockTags.DIRT) || topState.is(Blocks.GRASS_BLOCK);
+                if (level.destroyBlock(currentGround, !isDirtLike, citizen) && isDirtLike) {
+                    citizen.getNpcInventory().addItem(new ItemStack(Items.DIRT, 1));
+                }
+                return true;
+            }
+            if (currentGroundY < targetGroundY) {
+                BlockPos fillPos = new BlockPos(x, currentGroundY + 1, z);
+                if (!ensureDirt(citizen, level, fillPos, 8)) return true;
+                if (citizen.distanceToSqr(x + 0.5, citizen.getY(), z + 0.5) > 36.0) {
+                    CitizenEntity.moveTowards(citizen, level, x + 0.5, citizen.getY(), z + 0.5, 1.0);
+                    return true;
+                }
+                placeBlockFromInventory(citizen, level, fillPos, Blocks.DIRT.defaultBlockState(), Items.DIRT);
+                return true;
+            }
+            inner30Cursor += reverseFromEdge ? -1 : 1;
+        }
+        inner30Done = true;
+        citizen.announce("Nivelei todo o terreno inicial no raio de 60 blocos.");
+        return false;
+    }
 
     public String workStatus() {
         if (townCenter == null) return "Planejando os caminhos da vila";
@@ -892,10 +986,13 @@ public final class BuilderJob implements ProfessionJob {
             }
         }
 
-        // 2. Arcos / Portões estilo Millénaire na entrada e saída das construções, no raio de 30 blocos e na Mina
-        boolean isArchStep = (routeIdx == ROUTE_WAREHOUSE && (stepIdx == 1 || stepIdx == totalSteps - 1))
+        // 2. Arcos / Portões estilo Millénaire: só constrói quando o chão do Centro e da Warehouse já estiverem prontos
+        boolean floorsReady = plazaCursor >= 121
+            && (CivilizationData.get(level).warehouse(citizen.getNationId()) == null
+                || CivilizationData.get(level).warehousePlotPrepared(citizen.getNationId()));
+        boolean isArchStep = floorsReady && ((routeIdx == ROUTE_WAREHOUSE && (stepIdx == 1 || stepIdx == totalSteps - 1))
             || (routeIdx == ROUTE_MINE && (stepIdx == 1 || (totalSteps > 2 && stepIdx == totalSteps - 2)))
-            || (routeIdx >= ROUTE_CARDINAL_FIRST && distFromCenter == 30);
+            || (routeIdx >= ROUTE_CARDINAL_FIRST && distFromCenter == 30));
         if (isArchStep) {
             buildMillenaireArch(citizen, level, step, surfaceY);
             return;
@@ -940,7 +1037,7 @@ public final class BuilderJob implements ProfessionJob {
         citizen.swing(net.minecraft.world.InteractionHand.MAIN_HAND);
 
         // Pilares laterais (altura 4) fora da pista de 3 blocos, com fundação até o chão firme.
-        // Usa STONE_BRICKS (nunca OAK_LOG) para que o Lenhador jamais confunda a pilastra com uma árvore!
+        // Usa STONE_BRICKS (pedra) para que o Lenhador jamais confunda a pilastra com uma árvore!
         for (BlockPos pillarBase : new BlockPos[]{leftBase, rightBase}) {
             fillFoundationDown(level, pillarBase.below(), Blocks.COBBLESTONE);
             for (int y = 0; y < 4; y++) {
@@ -983,6 +1080,39 @@ public final class BuilderJob implements ProfessionJob {
         if (!hasOpenResourceRequest(data, citizen, reqId)) {
             requestResource(citizen, level, item, amount);
         }
+    }
+
+    private Item detectDominantWoodPlanks(ServerLevel level, BlockPos center) {
+        if (center == null) return Items.OAK_PLANKS;
+        java.util.Map<Item, Integer> counts = new java.util.HashMap<>();
+        for (int dx = -48; dx <= 48; dx += 4) {
+            for (int dz = -48; dz <= 48; dz += 4) {
+                BlockPos probe = new BlockPos(center.getX() + dx, center.getY(), center.getZ() + dz);
+                if (!level.hasChunkAt(probe)) continue;
+                int topY = level.getHeight(Heightmap.Types.MOTION_BLOCKING, probe.getX(), probe.getZ()) - 1;
+                for (int y = Math.max(level.getMinY() + 1, topY - 6); y <= topY; y++) {
+                    BlockState state = level.getBlockState(new BlockPos(probe.getX(), y, probe.getZ()));
+                    if (!state.is(BlockTags.LOGS)) continue;
+                    Item planks = planksForLogBlock(state.getBlock());
+                    if (planks != null) {
+                        counts.merge(planks, 1, Integer::sum);
+                    }
+                }
+            }
+        }
+        return counts.entrySet().stream()
+            .max(java.util.Map.Entry.comparingByValue())
+            .map(java.util.Map.Entry::getKey)
+            .orElse(Items.OAK_PLANKS);
+    }
+
+    private static Item planksForLogBlock(Block log) {
+        net.minecraft.resources.ResourceLocation key = BuiltInRegistries.BLOCK.getKey(log);
+        String path = key.getPath();
+        String species = path.replace("stripped_", "").replace("_log", "").replace("_wood", "");
+        Item planks = BuiltInRegistries.ITEM.getValue(
+            net.minecraft.resources.ResourceLocation.fromNamespaceAndPath(key.getNamespace(), species + "_planks"));
+        return (planks != Items.AIR && new ItemStack(planks).is(ItemTags.PLANKS)) ? planks : Items.OAK_PLANKS;
     }
 
     private static void fillFoundationDown(ServerLevel level, BlockPos start, Block block) {

@@ -1,0 +1,25 @@
+{
+  "width": 11,
+  "depth": 11,
+  "height": 1,
+  "legend": {
+    "x": "empty",
+    "A": "minecraft:chest",
+    "B": "minecraft:oak_wall_sign"
+  },
+  "layers": [
+    [
+      "xxxxxxxxxxx",
+      "xAxAxAxAxAx",
+      "xAxAxAxAxAx",
+      "xBxBxBxBxxx",
+      "xxxxxxxxxxx",
+      "xxxxxxxxxxx",
+      "xxxxxxxxxxx",
+      "xxxxxxxxxxx",
+      "xAxAxAxAxAx",
+      "xAxAxAxAxAx",
+      "xxxxxxxxxxx"
+    ]
+  ]
+}
